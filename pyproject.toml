@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyusbip"
+description = "A Python implementation of USB/IP server for sharing USB devices over network"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+authors = [
+    {name = "Jenish-Rudani", email = "jrudani1999@gmail.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers", 
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7", 
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Hardware :: Universal Serial Bus (USB)",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    "libusb1>=3.0.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-asyncio", 
+    "black",
+    "flake8",
+]
+
+[project.scripts]
+pyusbip = "pyusbip:main"
+
+[project.urls]
+Homepage = "https://github.com/jenish-rudani/pyusbip"
+"Bug Reports" = "https://github.com/jenish-rudani/pyusbip/issues"
+Source = "https://github.com/jenish-rudani/pyusbip"
+
+[tool.setuptools_scm]
+write_to = "pyusbip/_version.py"
