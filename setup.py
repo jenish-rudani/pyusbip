@@ -21,7 +21,6 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/jenish-rudani/pyusbip",
     packages=find_packages(),
-    py_modules=["pyusbip"],
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
