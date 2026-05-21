@@ -411,9 +411,55 @@ class USBIPConnection:
                 break
 
         self.say('disconnect')
-        for i in self.devices:
-            self.devices[i].hnd.close()
-            self.devices[i] = None
+        for devid in list(self.devices):
+            dev = self.devices[devid]
+            if dev is None or dev.hnd is None:
+                self.devices[devid] = None
+                continue
+            hnd = dev.hnd
+
+            # 1. Explicitly release every interface of the active
+            #    configuration. libusb_close()'s implicit release is
+            #    reliable on Linux but flaky on macOS — IOKit can leave
+            #    the device in a state where the next libusb_open from
+            #    probe-rs / STM32_Programmer_CLI fails with "USB error /
+            #    Couldn't create device after retries" until a physical
+            #    replug. releaseInterface on an unclaimed interface
+            #    raises USBErrorNotFound, which we ignore.
+            try:
+                dev_obj = hnd.getDevice()
+                try:
+                    bConfigVal = hnd.getConfiguration()
+                except Exception:
+                    bConfigVal = None
+                for _config in dev_obj.iterConfigurations():
+                    if bConfigVal is None or _config.getConfigurationValue() == bConfigVal:
+                        for i in range(_config.getNumInterfaces()):
+                            try:
+                                hnd.releaseInterface(i)
+                            except Exception:
+                                pass
+                        break
+            except Exception as e:
+                self.say('releaseInterface cleanup failed: {}'.format(e))
+
+            # 2. Reset the device so its firmware comes back to a clean
+            #    state for the next consumer. STLink V3 specifically can
+            #    sit with half-flushed SWD/JTAG bulk buffers after a
+            #    mid-stream USB/IP detach (probe-rs streaming when the
+            #    client disconnected) and refuse subsequent opens until
+            #    a USB port reset.
+            try:
+                hnd.resetDevice()
+            except Exception as e:
+                self.say('resetDevice failed: {}'.format(e))
+
+            # 3. Finally close the handle.
+            try:
+                hnd.close()
+            except Exception as e:
+                self.say('close failed: {}'.format(e))
+            self.devices[devid] = None
         await self.writer.drain()
         self.writer.close()
 
