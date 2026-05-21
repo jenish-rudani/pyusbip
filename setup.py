@@ -13,7 +13,7 @@ def read_readme():
 
 setup(
     name="pyusbip",
-    version="0.1.0",
+    version="1.0.0",
     author="Jenish-Rudani",
     author_email="jrudani1999@gmail.com",
     description="A Python implementation of USB/IP server for sharing USB devices over network",
