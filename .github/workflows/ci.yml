@@ -1,0 +1,95 @@
+# CI: runs on every push and PR.
+#
+# Two jobs:
+#   * lint        — ruff check + ruff format --check on ubuntu (fast).
+#   * smoke-macos — install pyusbip on a real macOS runner across a
+#                   couple of Python versions and verify the CLI entry
+#                   point + import surface work. We can't exercise USB
+#                   on a hosted runner (no hardware), but this catches
+#                   the most common regressions: a broken import path,
+#                   a missing dependency, an argparse syntax error, or
+#                   a libusb dylib hand-off problem on macOS.
+#
+# Concurrency: in-flight runs for a branch are cancelled when a new
+# push lands, so force-pushes don't pile up CI minutes.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        # Pin matches .pre-commit-config.yaml so local and CI agree.
+        run: pip install "ruff==0.15.14"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  smoke-macos:
+    # macos-14 runners are Apple Silicon, which is what pyusbip's
+    # actual users are on. macos-13 (Intel) would catch x86_64-only
+    # regressions but the project doesn't ship arch-specific code,
+    # so the extra runner cost isn't justified for now.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install libusb (Homebrew)
+        # libusb1 (the PyPI wrapper) loads the libusb dylib via ctypes
+        # at `import usb1`, which runs at pyusbip-import time. Without
+        # the dylib on the runner, even the import smoke test fails.
+        run: brew install libusb
+
+      - name: Install pyusbip (editable)
+        run: pip install -e .
+
+      - name: CLI entry point
+        # Verifies the `pyusbip = "pyusbip:main"` console script
+        # resolved correctly and argparse builds without crashing.
+        run: pyusbip --help
+
+      - name: Import surface
+        # Mirrors the public symbols listed in pyusbip/__init__.py's
+        # __all__. If anyone removes one of these without thinking,
+        # this fails loudly.
+        run: |
+          python - <<'PY'
+          from pyusbip import (
+              ControlPlane,
+              EventBus,
+              Match,
+              Registry,
+              USBIPConnection,
+              USBIPDevice,
+              USBIPPending,
+              USBIPProtocolErrorException,
+              USBIPServer,
+              USBIPUnimplementedException,
+              __version__,
+              main,
+          )
+          print("pyusbip", __version__, "import OK")
+          PY
