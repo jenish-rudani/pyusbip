@@ -56,13 +56,17 @@ jobs:
         # of the variable. See:
         # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
         #
-        # We import from pyusbip._version (not pyusbip) so reading the
-        # version doesn't pull in libusb1 — _version.py is deliberately
-        # import-free for exactly this case.
+        # We read _version.py via runpy.run_path (not `import
+        # pyusbip._version`) because importing a submodule still
+        # executes the parent package's __init__.py, which would pull
+        # in libusb1 / the libusb dylib. runpy.run_path runs the file
+        # in a fresh namespace with no package init — the same trick
+        # setuptools uses to resolve [tool.setuptools.dynamic] without
+        # installing the project's runtime deps.
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-          PKG_VERSION=$(python -c "from pyusbip._version import __version__; print(__version__)")
+          PKG_VERSION=$(python -c "import runpy; print(runpy.run_path('pyusbip/_version.py')['__version__'])")
           TAG_VERSION="${REF_NAME#v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::Tag '$TAG_VERSION' does not match pyusbip.__version__ '$PKG_VERSION'. Bump __version__ in pyusbip/__init__.py and re-tag."
