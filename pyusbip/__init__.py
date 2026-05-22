@@ -18,7 +18,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import signal
+import os
+import sys
 
 import usb1
 
@@ -34,7 +35,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 __all__ = [
     "ControlPlane",
@@ -247,43 +248,53 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
 
-    logger.info("Ctrl-C received, shutting down (max 4s)")
+    logger.info("Ctrl-C received, shutting down (max 6s)")
 
     async def _shutdown():
         if control is not None:
             await control.stop()
         await server.stop()
 
-    # A second Ctrl-C while _shutdown() runs (or during loop.close /
-    # usbctx.close) used to surface as a KeyboardInterrupt traceback.
-    # Each cleanup step is wrapped independently so any failure is
-    # logged and the others still execute — the goal is "exit
-    # quickly, no traceback" once the operator has signalled shutdown.
+    # Shutdown is bounded at 6 seconds total. Past that, we force-exit
+    # via os._exit() rather than let Python's atexit run, because the
+    # tail end of normal shutdown (libusb1's weakref finalizer →
+    # context.handleEvents) can block indefinitely when a USB device
+    # is held by another process — e.g. a serial monitor open on
+    # /dev/ttyACM* inside the dev container. The libusb_exit call
+    # waits for pending transfers that will never complete, which is
+    # what caused multi-second hangs (and Ctrl-C-resistant zombies)
+    # in earlier revisions.
     try:
-        loop.run_until_complete(_shutdown())
+        loop.run_until_complete(asyncio.wait_for(_shutdown(), timeout=6.0))
+    except asyncio.TimeoutError:
+        logger.warning("shutdown timed out after 6s — forcing exit")
     except KeyboardInterrupt:
         logger.info("second Ctrl-C — forcing exit (OS will reap sockets)")
     except BaseException as e:
         logger.warning("shutdown step raised: %s", e)
 
-    try:
-        loop.close()
-    except BaseException:
-        pass
-
-    try:
-        usbctx.close()
-    except BaseException:
-        pass
-
     logger.info("bye")
 
-    # Past this point, Python will run atexit handlers (notably
-    # libusb1's weakref finalizer, which calls context.handleEvents).
-    # A Ctrl-C landing in one of those used to surface as
-    # "Exception ignored in atexit callback ... KeyboardInterrupt".
-    # Block further SIGINT so the finalizers can complete in peace.
+    # Force-exit. We deliberately skip:
+    #   * loop.close()             — Python's internal accounting only
+    #   * usbctx.close()           — can hang on libusb_exit
+    #   * atexit handlers          — would re-trigger libusb's finalizer
+    #   * Python's normal teardown — gc + thread joins of the executor
+    #                                 used by _cleanup_devices_async,
+    #                                 which is exactly what we want to
+    #                                 abandon if it's stuck on a held
+    #                                 device.
+    # os._exit returns control to the kernel. Sockets, FDs, kernel-side
+    # libusb state, and threads are all cleaned up by the OS. Flushing
+    # the logger first so "bye" actually appears in the terminal.
     try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except (ValueError, OSError):
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
         pass
+    os._exit(0)
