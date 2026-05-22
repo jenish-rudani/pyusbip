@@ -18,7 +18,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import threading
+import os
+import sys
 
 import usb1
 
@@ -34,7 +35,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 
 __all__ = [
     "ControlPlane",
@@ -264,39 +265,36 @@ def main(argv: list[str] | None = None) -> None:
     except BaseException as e:
         logger.warning("shutdown step raised: %s", e)
 
-    try:
-        loop.close()
-    except BaseException:
-        pass
-
-    # libusb_exit (called by usbctx.close()) does a polite shutdown:
-    # cancels pending transfers, flushes callbacks, releases IOKit
-    # references. Politeness matters on macOS — without it the next
-    # pyusbip launch sometimes inherits a stale claim and the first
-    # IMPORT's SET_CONFIGURATION fails with NO_DEVICE.
-    #
-    # However, libusb_exit can hang when a device is held by another
-    # process (e.g. serial monitor on /dev/ttyACM* in the dev
-    # container). We run it in a daemon thread with a bounded join so
-    # politeness is best-effort: it gets ~3s to complete, then we move
-    # on. The thread keeps running in the background; Python's exit
-    # reaps it.
-    def _close_libusb():
-        try:
-            usbctx.close()
-        except Exception:
-            pass
-
-    close_thread = threading.Thread(target=_close_libusb, daemon=True, name="pyusbip-libusb-close")
-    close_thread.start()
-    close_thread.join(timeout=3.0)
-    if close_thread.is_alive():
-        logger.info(
-            "libusb cleanup still running after 3s (likely device held by another "
-            "process — close any serial monitor in the dev container). Exiting; "
-            "the OS will reap any remaining state."
-        )
-    else:
-        logger.debug("libusb context closed")
-
     logger.info("bye")
+
+    # Force-exit via os._exit. We deliberately skip:
+    #
+    #   * Python's atexit handlers — notably libusb1's weakref
+    #     finalizer (context.handleEvents()), which blocks when
+    #     a device is held by another process. Without this skip,
+    #     the join of the default asyncio ThreadPoolExecutor in
+    #     concurrent.futures._python_exit hangs on the abandoned
+    #     _cleanup_devices_async work, forcing multiple Ctrl-Cs.
+    #
+    #   * usbctx.close()        — same hang, called explicitly.
+    #   * loop.close()          — Python-internal bookkeeping;
+    #                              process exit handles it.
+    #
+    # We previously avoided os._exit because skipping libusb's
+    # graceful shutdown risked leaving stale IOKit claims for
+    # the *next* pyusbip launch. That risk is now mitigated by
+    # handle_op_import's smoke-test (server.py), which catches
+    # stale handles at IMPORT time and issues a reset to unstick
+    # them. So fast exit here is the right trade: bounded
+    # shutdown of OUR work, OS reaps everything else.
+    try:
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(0)
