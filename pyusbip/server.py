@@ -526,20 +526,25 @@ class USBIPConnection:
             if direction == USBIP_DIR_IN:
 
                 def callback(xfer_):
-                    # Callbacks can fire after _cleanup_devices closed
-                    # the writer (cancellation arrives at the transfer
-                    # asynchronously). Guard against writing to a
-                    # closed transport so we don't raise inside
-                    # libusb's C-level event handler.
-                    if self.writer.is_closing():
-                        self.urbs.pop(seqnum, None)
+                    # If the URB is no longer in self.urbs, one of two
+                    # things happened:
+                    #   (a) handle_urb_unlink popped it and we already
+                    #       sent RET_UNLINK to the client. Sending a
+                    #       RET_SUBMIT *too* would be a protocol
+                    #       violation (the client's URB has exactly
+                    #       one terminating response).
+                    #   (b) connection cleanup ran and the writer is
+                    #       closing. Either way: no response, just
+                    #       quietly exit.
+                    if seqnum not in self.urbs or self.writer.is_closing():
+                        self.trace(
+                            f"callback IN seqnum {seqnum:x} suppressed (unlinked or writer closing)"
+                        )
                         return
                     libusb_status = xfer.getStatus()
                     # Translate libusb transfer status to USBIP errno.
                     # Previously we sent `-libusb_status` directly, which
-                    # gave the kernel garbage errno values (status 3 →
-                    # -ESRCH, etc.) and made vhci tear down the port on
-                    # routine URB cancellations.
+                    # gave the kernel garbage errno values.
                     urb_status = libusb_status_to_usbip_errno(libusb_status)
                     self.trace(
                         f"callback IN seqnum {seqnum:x} libusb_status {libusb_status} "
@@ -569,8 +574,11 @@ class USBIPConnection:
             else:
 
                 def callback(xfer_):
-                    if self.writer.is_closing():
-                        self.urbs.pop(seqnum, None)
+                    if seqnum not in self.urbs or self.writer.is_closing():
+                        self.trace(
+                            f"callback OUT seqnum {seqnum:x} suppressed "
+                            f"(unlinked or writer closing)"
+                        )
                         return
                     libusb_status = xfer.getStatus()
                     urb_status = libusb_status_to_usbip_errno(libusb_status)
@@ -676,7 +684,21 @@ class USBIPConnection:
             rv = -USB_ENOENT
         else:
             rv = 0
-            self.urbs[sseqnum].xfer.cancel()
+            # Pop the URB BEFORE we cancel. Two reasons:
+            #   1. The cancellation triggers an async libusb callback
+            #      that would otherwise fire RET_SUBMIT for this seqnum.
+            #      With it popped, the callback sees the seqnum is
+            #      already gone and suppresses RET_SUBMIT — the URB has
+            #      exactly one terminating response (RET_UNLINK), which
+            #      is what the USB/IP protocol requires.
+            #   2. Pre-1.1.0 we never sent RET_UNLINK, so this race was
+            #      invisible. Sending both RET_UNLINK and RET_SUBMIT
+            #      for the same URB is a protocol violation that
+            #      vhci-hcd reacts to by detaching the port — the root
+            #      cause of "serial monitor disconnect detaches the
+            #      device" in 1.1.0+.
+            pending = self.urbs.pop(sseqnum)
+            pending.xfer.cancel()
 
         resp = struct.pack(
             ">IIIIIiiiii8s",
