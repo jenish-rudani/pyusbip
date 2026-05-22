@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import signal
 
 import usb1
 
@@ -33,7 +34,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 __all__ = [
     "ControlPlane",
@@ -276,3 +277,13 @@ def main(argv: list[str] | None = None) -> None:
         pass
 
     logger.info("bye")
+
+    # Past this point, Python will run atexit handlers (notably
+    # libusb1's weakref finalizer, which calls context.handleEvents).
+    # A Ctrl-C landing in one of those used to surface as
+    # "Exception ignored in atexit callback ... KeyboardInterrupt".
+    # Block further SIGINT so the finalizers can complete in peace.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass

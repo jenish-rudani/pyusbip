@@ -704,8 +704,8 @@ class USBIPConnection:
             self.trace("probe (no bytes sent)")
 
         try:
-            self._cleanup_devices()
-        except BaseException as e:
+            await self._cleanup_devices_async()
+        except Exception as e:
             # Belt-and-braces. _cleanup_devices already catches
             # BaseException internally, but if a future refactor
             # adds a path that escapes, the asyncio task still
@@ -719,6 +719,46 @@ class USBIPConnection:
             self.writer.close()
         except BaseException:
             pass
+
+    async def _cleanup_devices_async(self, timeout: float = 4.0) -> None:
+        """Run _cleanup_devices off the event loop with a bounded
+        timeout.
+
+        Why: libusb's `hnd.close()` blocks waiting for outstanding
+        URBs to flush and for the device's refcount to drop to zero.
+        In the typical pyusbip-on-macOS + Docker stack, a process
+        inside the dev container (e.g. a serial monitor opened on
+        /dev/ttyACM0) holds the device open. macOS can't actually
+        revoke the in-container handle — close() waits, sometimes
+        for many seconds. That used to wedge the asyncio loop and
+        force the operator into 2-3 Ctrl-Cs.
+
+        Behaviour now:
+          - If cleanup finishes within `timeout`, great.
+          - If it doesn't, we log a hint identifying which busid(s)
+            are stuck and what's likely holding them, then return.
+            The libusb thread keeps running in the background; the
+            OS reaps it at process exit.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self._cleanup_devices),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            still_held = [
+                dev.busid
+                for dev in self.devices.values()
+                if dev is not None and dev.hnd is not None
+            ]
+            self.say(
+                f"cleanup timed out after {timeout:.0f}s — "
+                f"device(s) {', '.join(still_held) or '?'} appear held by "
+                f"another process. If you have a serial monitor open on "
+                f"/dev/ttyACM* inside the dev container, close it. "
+                f"Handle(s) abandoned; the OS will clean up at process exit."
+            )
 
     def _cleanup_devices(self) -> None:
         """Release / reset / close every imported device. macOS IOKit
@@ -765,23 +805,35 @@ class USBIPConnection:
             # detail is at trace/debug level for diagnostic deep-dives.
             reset_skipped = False
 
+            # IMPORTANT: each step catches Exception (NOT BaseException).
+            # KeyboardInterrupt and SystemExit are BaseException
+            # subclasses; catching them here would swallow Ctrl-C and
+            # leave the server's main loop running, forcing the
+            # operator to press Ctrl-C multiple times. We let those
+            # propagate; the asyncio task that owns this cleanup will
+            # end, the main loop catches the signal, and shutdown
+            # proceeds normally. The trade-off is that a Ctrl-C
+            # mid-cleanup may leave a libusb handle un-released —
+            # acceptable because the process is exiting and the OS
+            # reaps file descriptors at exit anyway.
+
             # 1. release interfaces of the active configuration
             self.trace(f"  {busid_label}: releasing interfaces")
             try:
                 dev_obj = hnd.getDevice()
                 try:
                     bConfigVal = hnd.getConfiguration()
-                except BaseException:
+                except Exception:
                     bConfigVal = None
                 for _config in dev_obj.iterConfigurations():
                     if bConfigVal is None or _config.getConfigurationValue() == bConfigVal:
                         for i in range(_config.getNumInterfaces()):
                             try:
                                 hnd.releaseInterface(i)
-                            except BaseException:
+                            except Exception:
                                 pass
                         break
-            except BaseException as e:
+            except Exception as e:
                 self.say(f"  {busid_label}: release failed: {e}")
 
             # 2. USB port reset so the next host-side libusb client
@@ -794,14 +846,14 @@ class USBIPConnection:
                 # disconnect — surface in the summary line, not as
                 # a separate scary error.
                 reset_skipped = True
-            except BaseException as e:
+            except Exception as e:
                 self.say(f"  {busid_label}: reset failed: {e}")
 
             # 3. close handle
             self.trace(f"  {busid_label}: closing handle")
             try:
                 hnd.close()
-            except BaseException as e:
+            except Exception as e:
                 self.say(f"  {busid_label}: close failed: {e}")
 
             self.say(
