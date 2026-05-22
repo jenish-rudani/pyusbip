@@ -18,8 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
-import sys
+import threading
 
 import usb1
 
@@ -35,7 +34,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 
 __all__ = [
     "ControlPlane",
@@ -255,46 +254,49 @@ def main(argv: list[str] | None = None) -> None:
             await control.stop()
         await server.stop()
 
-    # Shutdown is bounded at 6 seconds total. Past that, we force-exit
-    # via os._exit() rather than let Python's atexit run, because the
-    # tail end of normal shutdown (libusb1's weakref finalizer →
-    # context.handleEvents) can block indefinitely when a USB device
-    # is held by another process — e.g. a serial monitor open on
-    # /dev/ttyACM* inside the dev container. The libusb_exit call
-    # waits for pending transfers that will never complete, which is
-    # what caused multi-second hangs (and Ctrl-C-resistant zombies)
-    # in earlier revisions.
+    # Bounded asyncio shutdown.
     try:
         loop.run_until_complete(asyncio.wait_for(_shutdown(), timeout=6.0))
     except asyncio.TimeoutError:
-        logger.warning("shutdown timed out after 6s — forcing exit")
+        logger.warning("shutdown timed out after 6s — proceeding")
     except KeyboardInterrupt:
-        logger.info("second Ctrl-C — forcing exit (OS will reap sockets)")
+        logger.info("second Ctrl-C during shutdown — proceeding")
     except BaseException as e:
         logger.warning("shutdown step raised: %s", e)
 
-    logger.info("bye")
-
-    # Force-exit. We deliberately skip:
-    #   * loop.close()             — Python's internal accounting only
-    #   * usbctx.close()           — can hang on libusb_exit
-    #   * atexit handlers          — would re-trigger libusb's finalizer
-    #   * Python's normal teardown — gc + thread joins of the executor
-    #                                 used by _cleanup_devices_async,
-    #                                 which is exactly what we want to
-    #                                 abandon if it's stuck on a held
-    #                                 device.
-    # os._exit returns control to the kernel. Sockets, FDs, kernel-side
-    # libusb state, and threads are all cleaned up by the OS. Flushing
-    # the logger first so "bye" actually appears in the terminal.
     try:
-        for h in logging.getLogger().handlers:
-            try:
-                h.flush()
-            except Exception:
-                pass
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
+        loop.close()
+    except BaseException:
         pass
-    os._exit(0)
+
+    # libusb_exit (called by usbctx.close()) does a polite shutdown:
+    # cancels pending transfers, flushes callbacks, releases IOKit
+    # references. Politeness matters on macOS — without it the next
+    # pyusbip launch sometimes inherits a stale claim and the first
+    # IMPORT's SET_CONFIGURATION fails with NO_DEVICE.
+    #
+    # However, libusb_exit can hang when a device is held by another
+    # process (e.g. serial monitor on /dev/ttyACM* in the dev
+    # container). We run it in a daemon thread with a bounded join so
+    # politeness is best-effort: it gets ~3s to complete, then we move
+    # on. The thread keeps running in the background; Python's exit
+    # reaps it.
+    def _close_libusb():
+        try:
+            usbctx.close()
+        except Exception:
+            pass
+
+    close_thread = threading.Thread(target=_close_libusb, daemon=True, name="pyusbip-libusb-close")
+    close_thread.start()
+    close_thread.join(timeout=3.0)
+    if close_thread.is_alive():
+        logger.info(
+            "libusb cleanup still running after 3s (likely device held by another "
+            "process — close any serial monitor in the dev container). Exiting; "
+            "the OS will reap any remaining state."
+        )
+    else:
+        logger.debug("libusb context closed")
+
+    logger.info("bye")

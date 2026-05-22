@@ -290,6 +290,57 @@ class USBIPConnection:
             vid_pid = f"{dev.getVendorID():04x}:{dev.getProductID():04x}"
 
             hnd = dev.open()
+
+            # Programmatic smoke test before we tell the client the
+            # IMPORT succeeded. A previous session's libusb cleanup
+            # may have been abandoned (e.g. on Ctrl-C while a device
+            # was held by a serial monitor); macOS IOKit can then
+            # hand us a fresh handle that immediately fails on any
+            # real I/O. Catching it here means the client sees a
+            # clean ST_NA reject instead of "IMPORT succeeded, then
+            # the very first URB failed" — and we attempt a
+            # libusb_reset_device to unstick the device for the
+            # next attempt.
+            #
+            # We use getConfiguration() rather than a string
+            # descriptor read because it's the cheapest control
+            # transfer that actually round-trips to the device.
+            try:
+                current_cfg = hnd.getConfiguration()
+                self.trace(f"IMPORT {busid} smoke test ok (current cfg={current_cfg})")
+            except (
+                usb1.USBErrorNoDevice,
+                usb1.USBErrorNotFound,
+                usb1.USBErrorIO,
+                usb1.USBErrorTimeout,
+            ) as smoke_err:
+                self.say(
+                    f"IMPORT {busid} smoke test FAILED ({smoke_err}); "
+                    f"handle is stale, attempting reset"
+                )
+                try:
+                    hnd.resetDevice()
+                    self.say(
+                        f"IMPORT {busid} reset issued — device likely re-enumerated "
+                        f"with new busid. Rejecting this IMPORT; refresh DEVLIST and retry."
+                    )
+                except Exception as reset_err:
+                    self.say(
+                        f"IMPORT {busid} reset also failed ({reset_err}); physical replug needed"
+                    )
+                try:
+                    hnd.close()
+                except Exception:
+                    pass
+                resp = struct.pack(
+                    ">HHI",
+                    USBIP_VERSION,
+                    USBIP_OP_IMPORT | USBIP_REPLY,
+                    USBIP_ST_NA,
+                )
+                self.writer.write(resp)
+                return
+
             self.say(
                 "IMPORT {} → opened ({}{})".format(
                     busid,
