@@ -13,12 +13,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import sys
 import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import usb1
 
+from . import _macos
 from .protocol import (
     USB_ENOENT,
     USB_EPIPE,
@@ -911,11 +913,30 @@ class USBIPConnection:
             busid = dev.busid
 
             busid_label = busid or "?"
-            # Cleanup is 3 steps (release → reset → close) but we
-            # collapse them into one log line on success and break
-            # out per-step warnings only when something fails. Step
-            # detail is at trace/debug level for diagnostic deep-dives.
-            reset_skipped = False
+            # Cleanup sequence (release → reset → close [→ macOS
+            # re-enumerate]) is collapsed into one summary log line on
+            # success; per-step warnings only fire when something
+            # fails. Step detail is at trace/debug level for
+            # diagnostic deep-dives.
+            device_gone = False
+            darwin_reenum_ok = False
+
+            # Capture device identity BEFORE we touch the handle —
+            # the macOS IOKit re-enumerate path below needs to find
+            # the same device through a separate IOKit query, and
+            # libusb's getters fail after close().
+            vid = pid = 0
+            serial: str | None = None
+            try:
+                dev_obj_pre = hnd.getDevice()
+                vid = dev_obj_pre.getVendorID()
+                pid = dev_obj_pre.getProductID()
+            except Exception:
+                pass
+            try:
+                serial = hnd.getSerialNumber() or None
+            except Exception:
+                serial = None
 
             # IMPORTANT: each step catches Exception (NOT BaseException).
             # KeyboardInterrupt and SystemExit are BaseException
@@ -950,16 +971,23 @@ class USBIPConnection:
 
             # 2. USB port reset so the next host-side libusb client
             #    (probe-rs, STM32_Programmer_CLI) can open cleanly.
-            self.trace(f"  {busid_label}: resetting device")
-            try:
-                hnd.resetDevice()
-            except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound):
-                # Expected when the device was unplugged before
-                # disconnect — surface in the summary line, not as
-                # a separate scary error.
-                reset_skipped = True
-            except Exception as e:
-                self.say(f"  {busid_label}: reset failed: {e}")
+            #    Skipped on macOS — libusb_reset_device's darwin
+            #    backend falls back to a port reset that does NOT
+            #    cause IOKit to re-publish interface nubs, so
+            #    AppleUSBCDCACM and friends never re-attach. We do
+            #    the real re-enumeration via IOKit in step 4 after
+            #    close (IOKit needs an exclusive USBDeviceOpen).
+            if sys.platform != "darwin":
+                self.trace(f"  {busid_label}: resetting device")
+                try:
+                    hnd.resetDevice()
+                except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound):
+                    # Expected when the device was unplugged before
+                    # disconnect — surface in the summary line, not
+                    # as a separate scary error.
+                    device_gone = True
+                except Exception as e:
+                    self.say(f"  {busid_label}: reset failed: {e}")
 
             # 3. close handle
             self.trace(f"  {busid_label}: closing handle")
@@ -968,14 +996,30 @@ class USBIPConnection:
             except Exception as e:
                 self.say(f"  {busid_label}: close failed: {e}")
 
-            self.say(
-                "  {}: {}".format(
-                    busid_label,
-                    "released, closed (device was gone — no reset)"
-                    if reset_skipped
-                    else "released, reset, closed",
+            # 4. macOS only: IOKit USBDeviceReEnumerate. Must run
+            #    AFTER close because IOKit needs an exclusive open.
+            #    See pyusbip/_macos.py for the full rationale.
+            if sys.platform == "darwin":
+                if not vid:
+                    device_gone = True
+                else:
+                    self.trace(f"  {busid_label}: IOKit re-enumerate")
+                    try:
+                        darwin_reenum_ok = _macos.reenumerate_device(vid, pid, serial)
+                    except Exception as e:
+                        self.say(f"  {busid_label}: IOKit re-enumerate raised: {e}")
+
+            if device_gone:
+                summary = "released, closed (device was gone — no reset)"
+            elif sys.platform == "darwin":
+                summary = (
+                    "released, closed, IOKit re-enumerated"
+                    if darwin_reenum_ok
+                    else "released, closed (IOKit re-enumerate failed — may need physical replug)"
                 )
-            )
+            else:
+                summary = "released, reset, closed"
+            self.say(f"  {busid_label}: {summary}")
             self.devices[devid] = None
 
             if busid and self._on_detach:
