@@ -51,6 +51,7 @@ from .protocol import (
     USBIP_VERSION,
     USBIPProtocolErrorException,
     USBIPUnimplementedException,
+    libusb_status_to_usbip_errno,
 )
 from .registry import Registry
 
@@ -533,8 +534,17 @@ class USBIPConnection:
                     if self.writer.is_closing():
                         self.urbs.pop(seqnum, None)
                         return
+                    libusb_status = xfer.getStatus()
+                    # Translate libusb transfer status to USBIP errno.
+                    # Previously we sent `-libusb_status` directly, which
+                    # gave the kernel garbage errno values (status 3 →
+                    # -ESRCH, etc.) and made vhci tear down the port on
+                    # routine URB cancellations.
+                    urb_status = libusb_status_to_usbip_errno(libusb_status)
                     self.trace(
-                        f"callback IN seqnum {seqnum:x} status {xfer.getStatus()} len {xfer.getActualLength()} buflen {len(xfer.getBuffer())}"
+                        f"callback IN seqnum {seqnum:x} libusb_status {libusb_status} "
+                        f"urb_status {urb_status} len {xfer.getActualLength()} "
+                        f"buflen {len(xfer.getBuffer())}"
                     )
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
@@ -543,7 +553,7 @@ class USBIPConnection:
                         0,
                         0,
                         0,
-                        -xfer.getStatus(),
+                        urb_status,
                         xfer.getActualLength(),
                         0,
                         0,
@@ -562,7 +572,12 @@ class USBIPConnection:
                     if self.writer.is_closing():
                         self.urbs.pop(seqnum, None)
                         return
-                    self.trace(f"callback OUT seqnum {seqnum:x} status {xfer.getStatus()} ")
+                    libusb_status = xfer.getStatus()
+                    urb_status = libusb_status_to_usbip_errno(libusb_status)
+                    self.trace(
+                        f"callback OUT seqnum {seqnum:x} libusb_status {libusb_status} "
+                        f"urb_status {urb_status}"
+                    )
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
                         USBIP_RET_SUBMIT,
@@ -570,7 +585,7 @@ class USBIPConnection:
                         0,
                         0,
                         0,
-                        -xfer.getStatus(),
+                        urb_status,
                         xfer.getActualLength(),
                         0,
                         0,

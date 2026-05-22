@@ -36,7 +36,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 __all__ = [
     "ControlPlane",

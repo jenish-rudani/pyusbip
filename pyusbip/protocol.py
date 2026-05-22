@@ -64,6 +64,49 @@ USB_REQ_SET_INTERFACE = 0x0B
 USB_ENOENT = 2
 USB_EPIPE = 32
 
+# Mapping from python-libusb1 / libusb transfer status codes to the
+# kernel errno values the Linux vhci-hcd client expects in
+# USBIP_RET_SUBMIT.status. Without this mapping, pyusbip naively
+# negated the libusb status (e.g., status=3 → -3), which the kernel
+# interprets as -ESRCH (no such process) and treats as a fatal stub
+# failure → it detaches the entire port. That looked like "the
+# server randomly disconnects when a serial monitor closes a port",
+# because cdc_acm's UNLINK cascade fired CANCELLED-status callbacks.
+#
+# Values from Linux kernel <linux/errno.h>:
+#   EPROTO     = 71  (LIBUSB_TRANSFER_ERROR)
+#   EPIPE      = 32  (LIBUSB_TRANSFER_STALL)
+#   ETIMEDOUT  = 110 (LIBUSB_TRANSFER_TIMED_OUT)
+#   ENODEV     = 19  (LIBUSB_TRANSFER_NO_DEVICE)
+#   ECONNRESET = 104 (LIBUSB_TRANSFER_CANCELLED)
+#   EOVERFLOW  = 75  (LIBUSB_TRANSFER_OVERFLOW)
+#
+# libusb1 status codes (from libusb.h):
+#   LIBUSB_TRANSFER_COMPLETED   = 0
+#   LIBUSB_TRANSFER_ERROR       = 1
+#   LIBUSB_TRANSFER_TIMED_OUT   = 2
+#   LIBUSB_TRANSFER_CANCELLED   = 3
+#   LIBUSB_TRANSFER_STALL       = 4
+#   LIBUSB_TRANSFER_NO_DEVICE   = 5
+#   LIBUSB_TRANSFER_OVERFLOW    = 6
+LIBUSB_STATUS_TO_USBIP_ERRNO = {
+    0: 0,  # COMPLETED       → success
+    1: -71,  # ERROR            → -EPROTO
+    2: -110,  # TIMED_OUT        → -ETIMEDOUT
+    3: -104,  # CANCELLED        → -ECONNRESET
+    4: -32,  # STALL            → -EPIPE
+    5: -19,  # NO_DEVICE        → -ENODEV
+    6: -75,  # OVERFLOW         → -EOVERFLOW
+}
+
+
+def libusb_status_to_usbip_errno(status: int) -> int:
+    """Translate a libusb transfer status code to the negative-errno
+    value the USBIP_RET_SUBMIT.status field expects. Unknown statuses
+    default to -EPROTO so the kernel sees a generic protocol error
+    rather than a misleading ESRCH/EINTR."""
+    return LIBUSB_STATUS_TO_USBIP_ERRNO.get(status, -71)
+
 
 class USBIPUnimplementedException(Exception):
     """Raised when a USB/IP request asks for a feature pyusbip hasn't
