@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import usb1
 
@@ -36,8 +36,8 @@ logger = logging.getLogger("pyusbip.control")
 API_VERSION = 1
 
 
-def _hex(n: Optional[int]) -> Optional[str]:
-    return None if n is None else "0x{:04x}".format(n)
+def _hex(n: int | None) -> str | None:
+    return None if n is None else f"0x{n:04x}"
 
 
 def _read_string_safely(hnd_open_fn, getter_name: str) -> str:
@@ -59,9 +59,9 @@ def _read_string_safely(hnd_open_fn, getter_name: str) -> str:
 def _describe_device(
     dev,
     *,
-    attached_by_busid: Dict[str, str],
-    registry: Optional[Registry],
-) -> Dict[str, Any]:
+    attached_by_busid: dict[str, str],
+    registry: Registry | None,
+) -> dict[str, Any]:
     """Build the JSON record for one libusb device. Reads strings
     lazily via brief open/close; if the device is already in use we
     fall back to empty strings rather than failing the whole list."""
@@ -88,7 +88,7 @@ def _describe_device(
         "bus_id": busid,
         "vid": vid,
         "pid": pid,
-        "vid_pid": "{:04x}:{:04x}".format(vid, pid),
+        "vid_pid": f"{vid:04x}:{pid:04x}",
         "manufacturer": manufacturer,
         "product": product,
         "serial": serial,
@@ -120,7 +120,7 @@ class ControlPlane:
         self.event_bus = event_bus
         self.host = host
         self.port = port
-        self._server: Optional[asyncio.base_events.Server] = None
+        self._server: asyncio.base_events.Server | None = None
         self._started_at = time.time()
         # When the registry mutates (bind/unbind), re-emit a generic
         # event so SSE subscribers refresh their device tables.
@@ -137,14 +137,26 @@ class ControlPlane:
 
     async def stop(self) -> None:
         if self._server is not None:
+            logger.info("stopping HTTP control plane on %s:%d", self.host, self.port)
             self._server.close()
-            await self._server.wait_closed()
+            # Bounded wait: SSE clients hold connections open
+            # indefinitely (long-poll keepalive), and Python 3.12.1+'s
+            # wait_closed() now blocks on them. 2-second cap is more
+            # than enough for non-SSE handlers to finish.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+                logger.info("control plane stopped cleanly")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "control plane didn't drain in 2s (likely SSE clients "
+                    "still attached); forcing exit"
+                )
+            except BaseException:
+                pass
 
     # ---- per-connection handler -----------------------------------------
 
-    async def _handle(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             req = await self._read_request(reader)
             if req is None:
@@ -166,7 +178,7 @@ class ControlPlane:
 
     async def _read_request(
         self, reader: asyncio.StreamReader
-    ) -> Optional[Tuple[str, str, Dict[str, str], Dict[str, str], bytes]]:
+    ) -> tuple[str, str, dict[str, str], dict[str, str], bytes] | None:
         # Read the request line + headers. We bound the read at 8KiB
         # to defend against a slow-loris-style attack on an unbounded
         # readuntil — for a localhost-only control plane this is paranoid
@@ -186,7 +198,7 @@ class ControlPlane:
             return None
 
         path, _, query_str = raw_path.partition("?")
-        query: Dict[str, str] = {}
+        query: dict[str, str] = {}
         if query_str:
             for pair in query_str.split("&"):
                 if "=" in pair:
@@ -195,7 +207,7 @@ class ControlPlane:
                     k, v = pair, ""
                 query[k] = v
 
-        headers: Dict[str, str] = {}
+        headers: dict[str, str] = {}
         for line in lines[1:]:
             if not line:
                 continue
@@ -221,8 +233,8 @@ class ControlPlane:
         self,
         method: str,
         path: str,
-        query: Dict[str, str],
-        headers: Dict[str, str],
+        query: dict[str, str],
+        headers: dict[str, str],
         body: bytes,
         writer: asyncio.StreamWriter,
     ) -> None:
@@ -241,9 +253,15 @@ class ControlPlane:
 
     # ---- handlers -------------------------------------------------------
 
-    def _health_payload(self) -> Dict[str, Any]:
+    def _health_payload(self) -> dict[str, Any]:
+        # __version__ is imported lazily to avoid a hard circular
+        # dependency: pyusbip.__init__ already imports ControlPlane,
+        # so we can't import __version__ at module load.
+        from . import __version__ as pkg_version
+
         return {
             "ok": True,
+            "version": pkg_version,
             "api_version": API_VERSION,
             "uptime_s": int(time.time() - self._started_at),
             "devices_total": sum(1 for _ in self.usbctx.getDeviceList()),
@@ -252,7 +270,7 @@ class ControlPlane:
             "require_bind": self.usbip_server.require_bind,
         }
 
-    def _devices_payload(self) -> Dict[str, Any]:
+    def _devices_payload(self) -> dict[str, Any]:
         attached = dict(self.usbip_server.attached_by_busid)
         devices = []
         for dev in self.usbctx.getDeviceList():
@@ -273,9 +291,7 @@ class ControlPlane:
                 logger.exception("describe_device crashed")
         return {"devices": devices}
 
-    async def _handle_bind(
-        self, body: bytes, writer: asyncio.StreamWriter, *, add: bool
-    ) -> None:
+    async def _handle_bind(self, body: bytes, writer: asyncio.StreamWriter, *, add: bool) -> None:
         try:
             data = json.loads(body or b"{}")
         except json.JSONDecodeError as e:
@@ -286,7 +302,7 @@ class ControlPlane:
         # have to resolve to a current device. bus_id is convenient for
         # the GUI ("user clicked Bind on this row"); explicit fields are
         # the durable form (survives replug across different busids).
-        match: Optional[Match]
+        match: Match | None
         if "bus_id" in data:
             bus_id = str(data["bus_id"])
             resolved = self._lookup_device(bus_id)
@@ -329,7 +345,7 @@ class ControlPlane:
             },
         )
 
-    def _lookup_device(self, bus_id: str) -> Optional[Tuple[int, int, str]]:
+    def _lookup_device(self, bus_id: str) -> tuple[int, int, str] | None:
         for dev in self.usbctx.getDeviceList():
             if _busid_for(dev) == bus_id:
                 return dev.getVendorID(), dev.getProductID(), _read_serial_safely(dev)
@@ -372,32 +388,33 @@ class ControlPlane:
     # ---- response writers -----------------------------------------------
 
     async def _write_json(
-        self, writer: asyncio.StreamWriter, status: int, payload: Dict[str, Any]
+        self, writer: asyncio.StreamWriter, status: int, payload: dict[str, Any]
     ) -> None:
         body = json.dumps(payload).encode()
-        reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}.get(
-            status, "OK"
-        )
+        reason = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            500: "Internal Server Error",
+        }.get(status, "OK")
         head = (
-            "HTTP/1.1 {} {}\r\n"
+            f"HTTP/1.1 {status} {reason}\r\n"
             "Content-Type: application/json\r\n"
-            "Content-Length: {}\r\n"
+            f"Content-Length: {len(body)}\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n"
             "\r\n"
-        ).format(status, reason, len(body))
+        )
         writer.write(head.encode() + body)
         await writer.drain()
 
-    async def _sse_write(
-        self, writer: asyncio.StreamWriter, payload: Dict[str, Any]
-    ) -> None:
+    async def _sse_write(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
         line = "data: " + json.dumps(payload) + "\n\n"
         writer.write(line.encode())
         await writer.drain()
 
 
-def _parse_opt_int(v: Any) -> Optional[int]:
+def _parse_opt_int(v: Any) -> int | None:
     if v is None or v == "":
         return None
     if isinstance(v, int):

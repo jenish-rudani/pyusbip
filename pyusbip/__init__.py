@@ -18,20 +18,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
-from typing import List, Optional
 
 import usb1
 
-from . import events as ev_mod
-from .events import EventBus
 from .control import ControlPlane
+from .events import EventBus
 from .protocol import (
     USBIPProtocolErrorException,
     USBIPUnimplementedException,
 )
 from .registry import Match, Registry
-from .server import USBIPServer, USBIPConnection, USBIPDevice, USBIPPending
+from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
+
+# SINGLE SOURCE OF TRUTH for the package version.
+# pyproject.toml reads this via [tool.setuptools.dynamic].
+# Bump here when releasing — nothing else to update.
+__version__ = "1.0.6"
 
 __all__ = [
     "ControlPlane",
@@ -44,6 +46,7 @@ __all__ = [
     "USBIPProtocolErrorException",
     "USBIPServer",
     "USBIPUnimplementedException",
+    "__version__",
     "main",
 ]
 
@@ -58,7 +61,7 @@ DEFAULT_SHARED_FILE = "/etc/pyusbip/shared.json"
 logger = logging.getLogger("pyusbip")
 
 
-def _parse_vid_list(values: List[str]) -> Optional[set]:
+def _parse_vid_list(values: list[str]) -> set | None:
     """['0x0483', '1155,0x1366'] → {0x0483, 0x0483, 0x1366}.
     Returns None when the list is empty so callers can distinguish
     'no filter' from 'an empty filter that matches nothing'."""
@@ -71,7 +74,7 @@ def _parse_vid_list(values: List[str]) -> Optional[set]:
             try:
                 vids.add(int(part, 0))  # auto-detect 0x prefix
             except ValueError as e:
-                raise SystemExit("invalid --vid value: {!r}".format(part)) from e
+                raise SystemExit(f"invalid --vid value: {part!r}") from e
     return vids or None
 
 
@@ -89,16 +92,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="info",
         choices=["error", "warning", "info", "debug"],
         help="Verbosity. 'info' shows lifecycle events (connect, disconnect, "
-             "IMPORT, DEVLIST, set-configuration). 'debug' adds per-URB "
-             "callbacks (firehose during firmware flashing).",
+        "IMPORT, DEVLIST, set-configuration). 'debug' adds per-URB "
+        "callbacks (firehose during firmware flashing).",
     )
     parser.add_argument(
         "--vid",
         action="append",
         default=[],
         help="Restrict exported devices to these USB vendor IDs (hex or "
-             "decimal). Repeat or comma-separate. Example: "
-             "--vid 0x0483 --vid 0x1366. Default: export everything.",
+        "decimal). Repeat or comma-separate. Example: "
+        "--vid 0x0483 --vid 0x1366. Default: export everything.",
     )
     parser.add_argument(
         "--host",
@@ -115,8 +118,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--no-control-plane",
         action="store_true",
         help="Disable the HTTP control plane. By default it listens on "
-             "--control-host:--control-port for GET /devices, POST /bind, "
-             "POST /unbind, and SSE /events.",
+        "--control-host:--control-port for GET /devices, POST /bind, "
+        "POST /unbind, and SSE /events.",
     )
     parser.add_argument(
         "--control-host",
@@ -133,19 +136,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--shared-file",
         default=DEFAULT_SHARED_FILE,
         help="JSON file holding the persistent bind allowlist "
-             "(default: %(default)s). Created on first --bind.",
+        "(default: %(default)s). Created on first --bind.",
     )
     parser.add_argument(
         "--require-bind",
         action="store_true",
         help="Only export devices that match an entry in the bind "
-             "allowlist (Windows usbipd-win semantics). Without this, "
-             "every device passing --vid is exported (legacy behavior).",
+        "allowlist (Windows usbipd-win semantics). Without this, "
+        "every device passing --vid is exported (legacy behavior).",
     )
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entry point. Wired in pyproject.toml as `pyusbip = pyusbip:main`."""
     args = _build_arg_parser().parse_args(argv)
 
@@ -155,11 +158,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         datefmt="%H:%M:%S",
     )
 
+    logger.info("pyusbip %s starting (log-level=%s)", __version__, args.log_level)
+
     vid_filter = _parse_vid_list(args.vid)
     if vid_filter is not None:
         logger.info(
-            "filtering DEVLIST/IMPORT to vendor IDs: %s",
-            ", ".join("0x{:04x}".format(v) for v in sorted(vid_filter)),
+            "exporting only VID(s): %s",
+            ", ".join(f"0x{v:04x}" for v in sorted(vid_filter)),
         )
 
     # Load the registry early — operator may have pre-populated it via
@@ -167,10 +172,27 @@ def main(argv: Optional[List[str]] = None) -> None:
     # to observe the correct allowlist from the first device scan.
     registry = Registry(path=args.shared_file)
     registry.load()
-    if args.require_bind and not registry:
-        logger.warning(
-            "--require-bind set but registry is empty; no devices will be "
-            "exported until you bind one (POST /bind on the control plane)"
+    if args.require_bind:
+        if registry:
+            logger.info(
+                "require-bind mode ON; %d allowlist entr%s loaded from %s",
+                len(registry),
+                "y" if len(registry) == 1 else "ies",
+                args.shared_file,
+            )
+        else:
+            logger.warning(
+                "require-bind mode ON but allowlist is empty (%s); "
+                "no devices will be exported until POST /bind is called",
+                args.shared_file,
+            )
+    elif registry:
+        logger.info(
+            "allowlist recorded at %s (%d entr%s, NOT enforced — pass "
+            "--require-bind to gate exports)",
+            args.shared_file,
+            len(registry),
+            "y" if len(registry) == 1 else "ies",
         )
 
     usbctx = usb1.USBContext()
@@ -192,7 +214,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         event_bus=event_bus,
     )
 
-    control: Optional[ControlPlane] = None
+    control: ControlPlane | None = None
     if not args.no_control_plane:
         control = ControlPlane(
             loop,
@@ -206,17 +228,16 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     async def _startup():
         await server.start()
+        logger.info("USB/IP server ready: %s:%d", args.host, args.port)
         if control is not None:
             await control.start()
-        logger.info(
-            "USB/IP serving on %s:%d", args.host, args.port
-        )
-        if control is not None:
             logger.info(
-                "control plane on http://%s:%d (GET /devices, /events, POST /bind, /unbind)",
+                "control plane ready: http://%s:%d  (GET /health /devices /events, "
+                "POST /bind /unbind)",
                 args.control_host,
                 args.control_port,
             )
+        logger.info("ready — Ctrl-C to exit")
 
     loop.run_until_complete(_startup())
 
@@ -225,13 +246,33 @@ def main(argv: Optional[List[str]] = None) -> None:
     except KeyboardInterrupt:
         pass
 
-    logger.info("shutting down...")
+    logger.info("Ctrl-C received, shutting down (max 4s)")
 
     async def _shutdown():
         if control is not None:
             await control.stop()
         await server.stop()
 
-    loop.run_until_complete(_shutdown())
-    loop.close()
-    usbctx.close()
+    # A second Ctrl-C while _shutdown() runs (or during loop.close /
+    # usbctx.close) used to surface as a KeyboardInterrupt traceback.
+    # Each cleanup step is wrapped independently so any failure is
+    # logged and the others still execute — the goal is "exit
+    # quickly, no traceback" once the operator has signalled shutdown.
+    try:
+        loop.run_until_complete(_shutdown())
+    except KeyboardInterrupt:
+        logger.info("second Ctrl-C — forcing exit (OS will reap sockets)")
+    except BaseException as e:
+        logger.warning("shutdown step raised: %s", e)
+
+    try:
+        loop.close()
+    except BaseException:
+        pass
+
+    try:
+        usbctx.close()
+    except BaseException:
+        pass
+
+    logger.info("bye")

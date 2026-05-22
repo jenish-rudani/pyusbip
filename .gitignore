@@ -1,3 +1,11 @@
+# Lock files. pyusbip is a library — lock files belong to *consumers*
+# of the library (apps that depend on it), not the library itself.
+# Keeping them out of the repo prevents permission churn (root-owned
+# locks created by `sudo` invocations) and avoids stale-dep noise.
+uv.lock
+poetry.lock
+Pipfile.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

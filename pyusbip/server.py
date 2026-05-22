@@ -14,15 +14,15 @@ import asyncio
 import logging
 import struct
 import traceback
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import usb1
 
 from . import events as ev
 from .protocol import (
-    USB_EPIPE,
     USB_ENOENT,
+    USB_EPIPE,
     USB_RECIP_DEVICE,
     USB_RECIP_INTERFACE,
     USB_REQ_SET_ADDRESS,
@@ -61,6 +61,7 @@ logger = logging.getLogger("pyusbip.server")
 class USBIPDevice:
     """One opened libusb handle, keyed by the synthesised devid we
     return in IMPORT (busnum<<16 | devnum)."""
+
     devid: int
     hnd: Any  # libusb1.USBDeviceHandle
     busid: str = ""  # e.g. "2-19", populated at IMPORT time
@@ -70,13 +71,14 @@ class USBIPDevice:
 class USBIPPending:
     """One in-flight URB; we keep these so UNLINK can cancel the
     underlying libusb transfer."""
+
     seqnum: int
     device: USBIPDevice
     xfer: Any  # libusb1 transfer handle
 
 
 def _busid_for(dev) -> str:
-    return "{}-{}".format(dev.getBusNumber(), dev.getDeviceAddress())
+    return f"{dev.getBusNumber()}-{dev.getDeviceAddress()}"
 
 
 def _read_serial_safely(dev) -> str:
@@ -115,12 +117,12 @@ class USBIPConnection:
         writer: asyncio.StreamWriter,
         usbctx: usb1.USBContext,
         *,
-        vid_filter: Optional[set] = None,
-        registry: Optional[Registry] = None,
+        vid_filter: set | None = None,
+        registry: Registry | None = None,
         require_bind: bool = False,
-        event_bus: Optional[ev.EventBus] = None,
-        on_attach: Optional[Callable[[str, str], None]] = None,
-        on_detach: Optional[Callable[[str, str], None]] = None,
+        event_bus: ev.EventBus | None = None,
+        on_attach: Callable[[str, str], None] | None = None,
+        on_detach: Callable[[str, str], None] | None = None,
     ):
         self.reader = reader
         self.writer = writer
@@ -135,8 +137,8 @@ class USBIPConnection:
         # for each device freed in cleanup.
         self._on_attach = on_attach
         self._on_detach = on_detach
-        self.devices: Dict[int, Optional[USBIPDevice]] = {}
-        self.urbs: Dict[int, USBIPPending] = {}
+        self.devices: dict[int, USBIPDevice | None] = {}
+        self.urbs: dict[int, USBIPPending] = {}
         self._peer = writer.get_extra_info("peername")
 
     # ---- logging helpers ------------------------------------------------
@@ -162,16 +164,14 @@ class USBIPConnection:
             if self.registry is None or not self.registry:
                 return False
             serial = _read_serial_safely(dev)
-            if not self.registry.is_allowed(
-                dev.getVendorID(), dev.getProductID(), serial
-            ):
+            if not self.registry.is_allowed(dev.getVendorID(), dev.getProductID(), serial):
                 return False
         return True
 
     # ---- protocol packers (preserved from the monolith) -----------------
 
     def pack_device_desc(self, dev, interfaces: bool = True) -> bytes:
-        path = "pyusbip/{}/{}".format(dev.getBusNumber(), dev.getDeviceAddress())
+        path = f"pyusbip/{dev.getBusNumber()}/{dev.getDeviceAddress()}"
         busid = _busid_for(dev)
         busnum = dev.getBusNumber()
         devnum = dev.getDeviceAddress()
@@ -265,7 +265,7 @@ class USBIPConnection:
             if busid != _busid_for(dev):
                 continue
             if not self._device_allowed(dev):
-                self.say("device {} rejected by filter/bind policy".format(busid))
+                self.say(f"IMPORT {busid} rejected (not in --vid filter / require-bind allowlist)")
                 resp = struct.pack(
                     ">HHI",
                     USBIP_VERSION,
@@ -275,8 +275,21 @@ class USBIPConnection:
                 self.writer.write(resp)
                 return
 
+            # Read a short product label for the log; best-effort.
+            try:
+                product = dev.getProduct() or ""
+            except Exception:
+                product = ""
+            vid_pid = f"{dev.getVendorID():04x}:{dev.getProductID():04x}"
+
             hnd = dev.open()
-            self.say("opened device {}".format(busid))
+            self.say(
+                "IMPORT {} → opened ({}{})".format(
+                    busid,
+                    vid_pid,
+                    ", " + product if product else "",
+                )
+            )
             devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
             self.devices[devid] = USBIPDevice(devid=devid, hnd=hnd, busid=busid)
             resp = struct.pack(
@@ -296,10 +309,8 @@ class USBIPConnection:
                 )
             return
 
-        self.say("device not found: {}".format(busid))
-        resp = struct.pack(
-            ">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_NA
-        )
+        self.say(f"IMPORT {busid} → device not found")
+        resp = struct.pack(">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_NA)
         self.writer.write(resp)
 
     # ---- URB submit / unlink (same logic as the monolith) ---------------
@@ -312,40 +323,26 @@ class USBIPConnection:
         )
 
         if number_of_packets != 0:
-            raise USBIPUnimplementedException(
-                "ISO number_of_packets {}".format(number_of_packets)
-            )
+            raise USBIPUnimplementedException(f"ISO number_of_packets {number_of_packets}")
 
         if direction == USBIP_DIR_OUT:
             buf = await self.reader.readexactly(buflen)
 
-        (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack(
-            "<BBHHH", setup
-        )
+        (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack("<BBHHH", setup)
 
-        self.trace(
-            "seq {:x}: ep {}, direction {}, {} bytes".format(seqnum, ep, direction, buflen)
-        )
+        self.trace(f"seq {seqnum:x}: ep {ep}, direction {direction}, {buflen} bytes")
 
         if ep == 0:
             if wLength != buflen:
-                raise USBIPProtocolErrorException(
-                    "wLength {} neq buflen {}".format(wLength, buflen)
-                )
+                raise USBIPProtocolErrorException(f"wLength {wLength} neq buflen {buflen}")
 
-            self.trace(
-                "EP0 requesttype {}, request {}".format(bRequestType, bRequest)
-            )
+            self.trace(f"EP0 requesttype {bRequestType}, request {bRequest}")
 
             fakeit = False
 
             if bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_ADDRESS:
                 raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
-            elif (
-                bRequestType == USB_RECIP_DEVICE
-                and bRequest == USB_REQ_SET_CONFIGURATION
-            ):
-                self.say("set configuration: {}".format(wValue))
+            elif bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_CONFIGURATION:
                 dev.hnd.setConfiguration(wValue)
 
                 config = None
@@ -353,8 +350,9 @@ class USBIPConnection:
                     if _config.getConfigurationValue() == wValue:
                         config = _config
                         break
-                for i in range(config.getNumInterfaces()):
-                    self.trace("  claim interface: {}".format(i))
+                n_ifaces = config.getNumInterfaces()
+                for i in range(n_ifaces):
+                    self.trace(f"  claim interface: {i}")
                     try:
                         if dev.hnd.kernelDriverActive(i):
                             self.trace("    detach kernel driver")
@@ -363,24 +361,18 @@ class USBIPConnection:
                         self.trace("    kernel driver check failed")
                         pass
                     dev.hnd.claimInterface(i)
+                self.say(f"{dev.busid} configured: cfg={wValue}, claimed {n_ifaces} interface(s)")
 
                 fakeit = True
-            elif (
-                bRequestType == USB_RECIP_INTERFACE
-                and bRequest == USB_REQ_SET_INTERFACE
-            ):
-                self.trace(
-                    "set interface alt setting: {} -> {}".format(wIndex, wValue)
-                )
+            elif bRequestType == USB_RECIP_INTERFACE and bRequest == USB_REQ_SET_INTERFACE:
+                self.trace(f"set interface alt setting: {wIndex} -> {wValue}")
                 dev.hnd.claimInterface(wIndex)
                 dev.hnd.setInterfaceAltSetting(wIndex, wValue)
                 fakeit = True
 
             try:
                 if direction == USBIP_DIR_IN:
-                    data = dev.hnd.controlRead(
-                        bRequestType, bRequest, wValue, wIndex, wLength
-                    )
+                    data = dev.hnd.controlRead(bRequestType, bRequest, wValue, wIndex, wLength)
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
                         USBIP_RET_SUBMIT,
@@ -396,17 +388,13 @@ class USBIPConnection:
                         b"",
                     )
                     resp += data
-                    self.trace(
-                        "wrote response with {}/{} bytes".format(len(data), wLength)
-                    )
+                    self.trace(f"wrote response with {len(data)}/{wLength} bytes")
                     self.writer.write(resp)
                 else:
                     if fakeit:
                         wlen = 0
                     else:
-                        wlen = dev.hnd.controlWrite(
-                            bRequestType, bRequest, wValue, wIndex, buf
-                        )
+                        wlen = dev.hnd.controlWrite(bRequestType, bRequest, wValue, wIndex, buf)
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
                         USBIP_RET_SUBMIT,
@@ -421,37 +409,43 @@ class USBIPConnection:
                         0,
                         b"",
                     )
-                    self.trace("wrote {}/{} bytes".format(wlen, wLength))
+                    self.trace(f"wrote {wlen}/{wLength} bytes")
                     self.writer.write(resp)
+            except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound) as e:
+                # Device went away (typical after a USB replug).
+                # See _submit_bulk_or_stall for the NO_DEVICE vs
+                # NOT_FOUND distinction. Tell the client this URB
+                # failed with -EPIPE so its kernel has a clean URB
+                # termination, then signal the outer connection loop
+                # to close.
+                self.say(f"device gone: {e}")
+                self._respond_control_error(seqnum)
+                raise USBIPProtocolErrorException(f"device disconnected ({e})") from e
             except usb1.USBErrorPipe:
-                resp = struct.pack(
-                    ">IIIIIiiiii8s",
-                    USBIP_RET_SUBMIT,
-                    seqnum,
-                    0,
-                    0,
-                    0,
-                    -USB_EPIPE,
-                    0,
-                    0,
-                    0,
-                    0,
-                    b"",
-                )
-                self.trace("EPIPE")
-                self.writer.write(resp)
+                # Standard endpoint stall — common during device init
+                # and benign. Quiet log.
+                self._respond_control_error(seqnum)
+            except usb1.USBError as e:
+                # Any other libusb error on the control transfer:
+                # USBErrorIO (LIBUSB_ERROR_IO), USBErrorTimeout,
+                # USBErrorOverflow, USBErrorBusy. Map all of them to
+                # -EPIPE on the wire — the client kernel will see a
+                # terminated URB and decide whether to retry / reset
+                # the endpoint, same behaviour as the Linux usbip-host
+                # kernel module. Log at INFO so the operator sees
+                # which class actually fired (USBErrorIO is what fires
+                # on macOS for a device that's been replugged but
+                # libusb hasn't refreshed yet).
+                self.say(f"control transfer error: {e}")
+                self._respond_control_error(seqnum)
         else:
             xfer = dev.hnd.getTransfer()
 
             if direction == USBIP_DIR_IN:
+
                 def callback(xfer_):
                     self.trace(
-                        "callback IN seqnum {:x} status {} len {} buflen {}".format(
-                            seqnum,
-                            xfer.getStatus(),
-                            xfer.getActualLength(),
-                            len(xfer.getBuffer()),
-                        )
+                        f"callback IN seqnum {seqnum:x} status {xfer.getStatus()} len {xfer.getActualLength()} buflen {len(xfer.getBuffer())}"
                     )
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
@@ -472,15 +466,11 @@ class USBIPConnection:
                     del self.urbs[seqnum]
 
                 xfer.setBulk(ep | 0x80, buflen, callback)
-                xfer.submit()
-                self.urbs[seqnum] = USBIPPending(seqnum=seqnum, device=dev, xfer=xfer)
+                self._submit_bulk_or_stall(xfer, seqnum, dev)
             else:
+
                 def callback(xfer_):
-                    self.trace(
-                        "callback OUT seqnum {:x} status {} ".format(
-                            seqnum, xfer.getStatus()
-                        )
-                    )
+                    self.trace(f"callback OUT seqnum {seqnum:x} status {xfer.getStatus()} ")
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
                         USBIP_RET_SUBMIT,
@@ -499,8 +489,72 @@ class USBIPConnection:
                     del self.urbs[seqnum]
 
                 xfer.setBulk(ep, buf, callback)
-                xfer.submit()
-                self.urbs[seqnum] = USBIPPending(seqnum=seqnum, device=dev, xfer=xfer)
+                self._submit_bulk_or_stall(xfer, seqnum, dev)
+
+    def _respond_control_error(self, seqnum: int) -> None:
+        """Send a USBIP_RET_SUBMIT with status=-EPIPE for a failed EP0
+        control transfer. Used for both genuine stalls and the broader
+        "libusb said no" cases (USBErrorIO, USBErrorTimeout, etc.) so
+        the client kernel sees a terminated URB instead of a hung wait.
+        Centralised so the various except branches above don't each
+        carry their own copy of the struct.pack."""
+        resp = struct.pack(
+            ">IIIIIiiiii8s",
+            USBIP_RET_SUBMIT,
+            seqnum,
+            0,
+            0,
+            0,
+            -USB_EPIPE,
+            0,
+            0,
+            0,
+            0,
+            b"",
+        )
+        self.writer.write(resp)
+
+    def _submit_bulk_or_stall(self, xfer, seqnum, dev) -> None:
+        """Submit a bulk transfer, translating libusb errors into
+        proper USBIP_RET_SUBMIT responses instead of letting them
+        kill the whole connection.
+
+        Why this matters: probe-rs/openocd issue thousands of bulk
+        URBs per second during SWD operations. A single stalled
+        endpoint (LIBUSB_ERROR_PIPE from xfer.submit()) used to take
+        down the entire pyusbip ↔ VM connection — operator saw
+        "force disconnect" mid-flash. The Linux usbip-host kernel
+        module handles this gracefully by reporting the stall to the
+        client kernel, which then issues a CLEAR_FEATURE/RESET; we
+        do the same by responding with status=-EPIPE here.
+        """
+        try:
+            xfer.submit()
+            self.urbs[seqnum] = USBIPPending(seqnum=seqnum, device=dev, xfer=xfer)
+            return
+        except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound) as e:
+            # Device is physically gone. LIBUSB_ERROR_NO_DEVICE (-4) is
+            # the canonical "device disconnected" code on Linux;
+            # LIBUSB_ERROR_NOT_FOUND (-5) is what macOS / some libusb
+            # versions return for the same condition when the
+            # handle's backing endpoint can no longer be resolved.
+            # Either way: acknowledge the URB with -EPIPE so the
+            # client kernel terminates it cleanly, then raise to
+            # break out of the connection loop — every subsequent
+            # URB would fail the same way.
+            self.say(f"bulk submit: device gone: {e}")
+            self._respond_control_error(seqnum)
+            raise USBIPProtocolErrorException(f"device disconnected ({e})") from e
+        except usb1.USBErrorPipe:
+            self.trace(f"bulk submit EPIPE seqnum {seqnum:x}")
+        except usb1.USBError as e:
+            # Other libusb errors (IO, BUSY, TIMEOUT, …): map to a
+            # generic EPIPE response so the client at least sees a
+            # terminated URB rather than a hung wait. The specific
+            # errno isn't reported by libusb here in a usable form.
+            self.say(f"bulk submit failed seqnum {seqnum:x}: {e}")
+
+        self._respond_control_error(seqnum)
 
     async def handle_urb_unlink(self, seqnum, dev, direction, ep):
         op_submit = ">Iiiii8s"
@@ -509,7 +563,7 @@ class USBIPConnection:
             op_submit, data
         )
 
-        self.trace("seq {:x}: UNLINK".format(sseqnum))
+        self.trace(f"seq {sseqnum:x}: UNLINK")
 
         if sseqnum not in self.urbs:
             rv = -USB_ENOENT
@@ -552,7 +606,7 @@ class USBIPConnection:
             (opcode, seqnum, devid, direction, ep) = struct.unpack(op_common, data)
 
             if devid not in self.devices or self.devices[devid] is None:
-                raise USBIPProtocolErrorException("devid unattached {:x}".format(devid))
+                raise USBIPProtocolErrorException(f"devid unattached {devid:x}")
             dev = self.devices[devid]
 
             if opcode == USBIP_CMD_SUBMIT:
@@ -562,7 +616,7 @@ class USBIPConnection:
             elif opcode == USBIP_RESET_DEV:
                 raise USBIPUnimplementedException("URB_RESET_DEV")
             else:
-                raise USBIPProtocolErrorException("bad USBIP URB {:x}".format(opcode))
+                raise USBIPProtocolErrorException(f"bad USBIP URB {opcode:x}")
         elif (version & 0xFF00) == 0x0100:
             op_common = ">HI"
             data = await self.reader.readexactly(struct.calcsize(op_common))
@@ -570,9 +624,7 @@ class USBIPConnection:
 
             if opcode == USBIP_OP_UNSPEC | USBIP_REQUEST:
                 self.writer.write(
-                    struct.pack(
-                        ">HHI", version, USBIP_OP_UNSPEC | USBIP_REPLY, USBIP_ST_OK
-                    )
+                    struct.pack(">HHI", version, USBIP_OP_UNSPEC | USBIP_REPLY, USBIP_ST_OK)
                 )
             elif opcode == USBIP_OP_DEVINFO | USBIP_REQUEST:
                 await self.reader.readexactly(USBIP_BUS_ID_SIZE)
@@ -582,44 +634,116 @@ class USBIPConnection:
                 self.handle_op_devlist()
             elif opcode == USBIP_OP_IMPORT | USBIP_REQUEST:
                 data = (await self.reader.readexactly(USBIP_BUS_ID_SIZE)).decode().rstrip("\0")
-                self.say("IMPORT {}".format(data))
+                self.say(f"IMPORT {data}")
                 self.handle_op_import(data)
             else:
-                raise USBIPProtocolErrorException("bad USBIP op {:x}".format(opcode))
+                raise USBIPProtocolErrorException(f"bad USBIP op {opcode:x}")
         else:
-            raise USBIPProtocolErrorException(
-                "unsupported USBIP version {:02x}".format(version)
-            )
+            raise USBIPProtocolErrorException(f"unsupported USBIP version {version:02x}")
 
         return True
 
     async def connection(self) -> None:
-        self.say("connect")
+        # Deferred "connect" log: TCP liveness probes from Bia-Factory's
+        # pyusbipRunning() create a connection-then-close with zero
+        # bytes exchanged. Logging "connect" + "disconnect" for every
+        # one makes the log look like a real session is opening and
+        # closing constantly. Instead we wait until handle_packet has
+        # successfully received at least one packet before emitting
+        # the connect line; silent probes are demoted to a single
+        # debug-level line.
+        any_packet_received = False
 
         while True:
             try:
                 success = await self.handle_packet()
+                if not any_packet_received:
+                    # First packet on this connection — now it's a
+                    # real session worth announcing.
+                    self.say("connect")
+                    any_packet_received = True
                 await self.writer.drain()
                 if not success:
                     break
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                # Server is shutting down. Let the asyncio task end
+                # cleanly after we finish device cleanup below — we
+                # specifically don't re-raise CancelledError because
+                # the surrounding _handle() shouldn't propagate it.
+                if any_packet_received:
+                    self.say("connection cancelled")
+                break
+            except USBIPProtocolErrorException as e:
+                # Intentional protocol-level exit — we raise this
+                # ourselves when libusb tells us the device is gone.
+                # No traceback: the cause was logged at the raise
+                # site with the actual libusb error.
+                if any_packet_received:
+                    self.say(f"closing session: {e}")
+                break
             except Exception:
-                traceback.print_exc()
-                self.say("force disconnect due to exception")
+                if any_packet_received:
+                    traceback.print_exc()
+                    self.say("force disconnect due to exception")
+                else:
+                    # Probe-style connection that errored before
+                    # sending a packet (rare). Log compactly at debug.
+                    self.trace("probe errored before any packet")
                 break
 
+        if any_packet_received:
+            self.say("disconnect")
+        else:
+            self.trace("probe (no bytes sent)")
+
         self.say("disconnect")
-        self._cleanup_devices()
+        try:
+            self._cleanup_devices()
+        except BaseException as e:
+            # Belt-and-braces. _cleanup_devices already catches
+            # BaseException internally, but if a future refactor
+            # adds a path that escapes, the asyncio task still
+            # ends cleanly rather than crashing the event loop.
+            self.say(f"cleanup raised: {e}")
         try:
             await self.writer.drain()
-        except Exception:
+        except BaseException:
             pass
-        self.writer.close()
+        try:
+            self.writer.close()
+        except BaseException:
+            pass
 
     def _cleanup_devices(self) -> None:
         """Release / reset / close every imported device. macOS IOKit
         leaves devices in an unopenable state otherwise; see the
         package README and the disconnect commit history for the gory
-        details."""
+        details.
+
+        Every step swallows BaseException (not just Exception): the
+        sequence is invoked from the asyncio task's normal-and-shutdown
+        paths alike, and `hnd.close()` internally calls
+        context.handleEvents(). On Ctrl-C, the resulting KeyboardInterrupt
+        used to bubble out as 'Unhandled exception in client_connected_cb'.
+        Catching BaseException keeps the shutdown clean — we'd rather
+        leak a libusb handle for the few ms before process exit than
+        have noisy tracebacks in the operator's terminal.
+        """
+        # Count live handles so the shutdown log gives the operator
+        # something to read while we wait. Devices that were already
+        # None (e.g. cleaned up earlier) are skipped silently.
+        live = [
+            (devid, dev)
+            for devid, dev in self.devices.items()
+            if dev is not None and dev.hnd is not None
+        ]
+        if live:
+            self.say(
+                "cleanup: {} device(s) ({})".format(
+                    len(live),
+                    ", ".join(dev.busid or "?" for _, dev in live),
+                )
+            )
         for devid in list(self.devices):
             dev = self.devices[devid]
             if dev is None or dev.hnd is None:
@@ -628,39 +752,60 @@ class USBIPConnection:
             hnd = dev.hnd
             busid = dev.busid
 
+            busid_label = busid or "?"
+            # Cleanup is 3 steps (release → reset → close) but we
+            # collapse them into one log line on success and break
+            # out per-step warnings only when something fails. Step
+            # detail is at trace/debug level for diagnostic deep-dives.
+            reset_skipped = False
+
             # 1. release interfaces of the active configuration
+            self.trace(f"  {busid_label}: releasing interfaces")
             try:
                 dev_obj = hnd.getDevice()
                 try:
                     bConfigVal = hnd.getConfiguration()
-                except Exception:
+                except BaseException:
                     bConfigVal = None
                 for _config in dev_obj.iterConfigurations():
-                    if (
-                        bConfigVal is None
-                        or _config.getConfigurationValue() == bConfigVal
-                    ):
+                    if bConfigVal is None or _config.getConfigurationValue() == bConfigVal:
                         for i in range(_config.getNumInterfaces()):
                             try:
                                 hnd.releaseInterface(i)
-                            except Exception:
+                            except BaseException:
                                 pass
                         break
-            except Exception as e:
-                self.say("releaseInterface cleanup failed: {}".format(e))
+            except BaseException as e:
+                self.say(f"  {busid_label}: release failed: {e}")
 
             # 2. USB port reset so the next host-side libusb client
-            #    (probe-rs, STM32_Programmer_CLI) can open cleanly
+            #    (probe-rs, STM32_Programmer_CLI) can open cleanly.
+            self.trace(f"  {busid_label}: resetting device")
             try:
                 hnd.resetDevice()
-            except Exception as e:
-                self.say("resetDevice failed: {}".format(e))
+            except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound):
+                # Expected when the device was unplugged before
+                # disconnect — surface in the summary line, not as
+                # a separate scary error.
+                reset_skipped = True
+            except BaseException as e:
+                self.say(f"  {busid_label}: reset failed: {e}")
 
             # 3. close handle
+            self.trace(f"  {busid_label}: closing handle")
             try:
                 hnd.close()
-            except Exception as e:
-                self.say("close failed: {}".format(e))
+            except BaseException as e:
+                self.say(f"  {busid_label}: close failed: {e}")
+
+            self.say(
+                "  {}: {}".format(
+                    busid_label,
+                    "released, closed (device was gone — no reset)"
+                    if reset_skipped
+                    else "released, reset, closed",
+                )
+            )
             self.devices[devid] = None
 
             if busid and self._on_detach:
@@ -691,10 +836,10 @@ class USBIPServer:
         *,
         host: str = "127.0.0.1",
         port: int = 3240,
-        vid_filter: Optional[set] = None,
-        registry: Optional[Registry] = None,
+        vid_filter: set | None = None,
+        registry: Registry | None = None,
         require_bind: bool = False,
-        event_bus: Optional[ev.EventBus] = None,
+        event_bus: ev.EventBus | None = None,
     ):
         self.loop = loop
         self.usbctx = usbctx
@@ -704,12 +849,12 @@ class USBIPServer:
         self.registry = registry
         self.require_bind = require_bind
         self.event_bus = event_bus
-        self._server: Optional[asyncio.base_events.Server] = None
+        self._server: asyncio.base_events.Server | None = None
         self._hotplug_handle = None
         # busid -> peer-string. Mutated only from the asyncio loop
         # thread (USBIPConnection._on_attach/_on_detach are called
         # synchronously from handle_op_import / cleanup), so no lock.
-        self.attached_by_busid: Dict[str, str] = {}
+        self.attached_by_busid: dict[str, str] = {}
 
     def _track_attach(self, busid: str, peer: str) -> None:
         self.attached_by_busid[busid] = peer
@@ -717,9 +862,7 @@ class USBIPServer:
     def _track_detach(self, busid: str, _peer: str) -> None:
         self.attached_by_busid.pop(busid, None)
 
-    async def _handle(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         conn = USBIPConnection(
             reader,
             writer,
@@ -757,9 +900,7 @@ class USBIPServer:
         # thread-safe.
         if self.event_bus is not None:
             try:
-                self._hotplug_handle = self.usbctx.hotplugRegisterCallback(
-                    self._on_hotplug
-                )
+                self._hotplug_handle = self.usbctx.hotplugRegisterCallback(self._on_hotplug)
             except Exception as e:
                 # Hotplug isn't supported on every libusb backend
                 # (notably some macOS minor versions historically).
@@ -775,11 +916,7 @@ class USBIPServer:
         APIs (EventBus.publish uses call_soon_threadsafe)."""
         if self.event_bus is None:
             return
-        kind = (
-            ev.DEVICE_ADDED
-            if event == usb1.HOTPLUG_EVENT_DEVICE_ARRIVED
-            else ev.DEVICE_REMOVED
-        )
+        kind = ev.DEVICE_ADDED if event == usb1.HOTPLUG_EVENT_DEVICE_ARRIVED else ev.DEVICE_REMOVED
         try:
             payload = {
                 "bus_id": _busid_for(dev),
@@ -793,9 +930,33 @@ class USBIPServer:
         self.event_bus.publish(kind, payload)
 
     async def stop(self) -> None:
+        active_busids = list(self.attached_by_busid.keys())
         if self._server is not None:
+            logger.info(
+                "stopping USB/IP server on %s:%d (%d active client(s)%s)",
+                self.host,
+                self.port,
+                len(active_busids),
+                ": " + ", ".join(active_busids) if active_busids else "",
+            )
             self._server.close()
-            await self._server.wait_closed()
+            # Bounded wait. In Python 3.12.1+, wait_closed() waits for
+            # active client handlers to finish — and our handlers don't
+            # finish until the client closes its end. On normal Ctrl-C
+            # shutdown the operator wants a fast exit, not a graceful
+            # drain, so cap at 2s. Beyond that we just stop awaiting;
+            # the OS will tear down the open sockets at process exit.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+                logger.info("USB/IP server stopped cleanly")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "USB/IP server didn't drain in 2s — %d client(s) still "
+                    "open; forcing exit (OS will close sockets)",
+                    len(active_busids),
+                )
+            except BaseException:
+                pass
         if self._hotplug_handle is not None:
             try:
                 self.usbctx.hotplugDeregisterCallback(self._hotplug_handle)

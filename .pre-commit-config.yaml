@@ -1,0 +1,44 @@
+# Pre-commit hooks for pyusbip.
+#
+# One-time setup after cloning:
+#
+#     uv tool install pre-commit          # or: pip install --user pre-commit
+#     pre-commit install                  # wires .git/hooks/pre-commit
+#
+# After that every `git commit` runs the hooks. They can also be invoked
+# directly: `pre-commit run --all-files` (CI / before pushing a large diff).
+#
+# Hooks are pinned to specific tags so behaviour is reproducible — bump
+# with `pre-commit autoupdate` when you want newer versions.
+
+# Project-wide exclude. Lock files (uv.lock, poetry.lock, Pipfile.lock)
+# are tool-managed — modifying them out from under the tool causes
+# checksum drift and "lock out of sync" errors. They're already
+# gitignored for this library, but defence-in-depth.
+exclude: '^(uv\.lock|poetry\.lock|Pipfile\.lock)$'
+
+repos:
+  # Generic hygiene: strip trailing whitespace, ensure a single trailing
+  # newline, catch syntax errors in YAML/TOML, block accidental large
+  # binaries.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-merge-conflict
+      - id: debug-statements          # blocks accidental `breakpoint()` / `pdb.set_trace()`
+
+  # Ruff: lint (--fix to auto-correct) + format. Combined replacement
+  # for black + flake8 + isort + a chunk of pyupgrade. Ruff is configured
+  # via [tool.ruff] in pyproject.toml so settings live in one place.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format

@@ -333,11 +333,46 @@ a sidecar at all.
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.8+
 - libusb1 (`pip install libusb1`)
 - macOS, Linux, or any host with libusb. Tested heavily on
   macOS 14/15 + Apple Silicon.
 - Root / administrator privileges to claim USB devices via libusb.
+
+## Development setup
+
+Lint + format is handled by [ruff](https://docs.astral.sh/ruff/)
+(replaces black + flake8 + isort). Hooks are wired through
+[pre-commit](https://pre-commit.com/) so every commit auto-runs them.
+
+```bash
+# One-time setup after cloning:
+uv tool install ruff                # or: pip install --user ruff
+uv tool install pre-commit          # or: pip install --user pre-commit
+pre-commit install                  # wires .git/hooks/pre-commit
+
+# Manual invocations:
+ruff format .                       # reformat in place
+ruff check . --fix                  # lint + autofix
+pre-commit run --all-files          # run all hooks against the whole repo
+```
+
+Ruff configuration lives in `pyproject.toml` under `[tool.ruff]`.
+Hook versions are pinned in `.pre-commit-config.yaml`; bump them with
+`pre-commit autoupdate`.
+
+## Releasing
+
+The version is the single string `__version__` in
+`pyusbip/__init__.py`. `pyproject.toml` reads it dynamically via
+`[tool.setuptools.dynamic]`, so a release bump is one edit:
+
+```bash
+# Edit pyusbip/__init__.py: __version__ = "X.Y.Z"
+git commit -am "release: X.Y.Z"
+git tag vX.Y.Z
+git push --tags
+```
 
 ## License
 

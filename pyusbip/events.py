@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict
+from typing import Any
 
 logger = logging.getLogger("pyusbip.events")
 
@@ -68,7 +68,7 @@ class EventBus:
         except ValueError:
             pass
 
-    def publish(self, event_type: str, payload: Dict[str, Any]) -> None:
+    def publish(self, event_type: str, payload: dict[str, Any]) -> None:
         """Publish an event. Safe to call from any thread (uses
         `call_soon_threadsafe` to hop onto the loop). Returns
         immediately; never blocks on slow subscribers."""
@@ -80,7 +80,7 @@ class EventBus:
         # safer and the cost is negligible.
         self._loop.call_soon_threadsafe(self._dispatch, event)
 
-    def _dispatch(self, event: Dict[str, Any]) -> None:
+    def _dispatch(self, event: dict[str, Any]) -> None:
         for q in list(self._subscribers):
             try:
                 q.put_nowait(event)

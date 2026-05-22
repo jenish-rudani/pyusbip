@@ -27,12 +27,13 @@ broader entries first.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 import os
 import threading
-from dataclasses import dataclass, field, asdict
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 logger = logging.getLogger("pyusbip.registry")
 
@@ -41,9 +42,10 @@ logger = logging.getLogger("pyusbip.registry")
 class Match:
     """One allowlist entry. Frozen so it's hashable and safe to keep in
     a set; fields are Optional[int|str] so unset == wildcard."""
-    vid: Optional[int] = None
-    pid: Optional[int] = None
-    serial: Optional[str] = None
+
+    vid: int | None = None
+    pid: int | None = None
+    serial: str | None = None
 
     def matches(self, vid: int, pid: int, serial: str) -> bool:
         if self.vid is not None and self.vid != vid:
@@ -54,18 +56,18 @@ class Match:
             return False
         return True
 
-    def to_dict(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
         if self.vid is not None:
-            out["vid"] = "0x{:04x}".format(self.vid)
+            out["vid"] = f"0x{self.vid:04x}"
         if self.pid is not None:
-            out["pid"] = "0x{:04x}".format(self.pid)
+            out["pid"] = f"0x{self.pid:04x}"
         if self.serial is not None:
             out["serial"] = self.serial
         return out
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Match":
+    def from_dict(cls, data: dict[str, Any]) -> Match:
         def _parse_int(v):
             if v is None:
                 return None
@@ -88,13 +90,14 @@ class Registry:
     thread (hotplug callback) and the asyncio loop (HTTP control
     plane) can both query/modify without races.
     """
-    path: Optional[str] = None  # None == in-memory only
-    entries: List[Match] = field(default_factory=list)
+
+    path: str | None = None  # None == in-memory only
+    entries: builtins.list[Match] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Listeners invoked after every mutation. Used by the server to
     # publish BIND_CHANGED events without registry needing to import
     # the EventBus directly (keeps the dependency one-way).
-    _listeners: List[Callable[[], None]] = field(default_factory=list, repr=False)
+    _listeners: builtins.list[Callable[[], None]] = field(default_factory=list, repr=False)
 
     def add_listener(self, fn: Callable[[], None]) -> None:
         self._listeners.append(fn)
@@ -114,7 +117,7 @@ class Registry:
         if not self.path:
             return
         try:
-            with open(self.path, "r") as f:
+            with open(self.path) as f:
                 data = json.load(f)
         except FileNotFoundError:
             logger.info("registry: no shared file at %s, starting empty", self.path)
@@ -191,7 +194,7 @@ class Registry:
                     return True
         return False
 
-    def list(self) -> List[Match]:
+    def list(self) -> builtins.list[Match]:
         with self._lock:
             return list(self.entries)
 

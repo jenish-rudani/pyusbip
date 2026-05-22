@@ -1,41 +1,49 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyusbip"
-description = "A Python implementation of USB/IP server for sharing USB devices over network"
+description = "USB/IP server backed by libusb, with persistent bind allowlist and HTTP control plane"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Jenish-Rudani", email = "jrudani1999@gmail.com"},
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers", 
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.6",
-    "Programming Language :: Python :: 3.7", 
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Hardware :: Universal Serial Bus (USB)",
     "Topic :: System :: Networking",
 ]
+
+# Single source of truth: read the version from pyusbip/__init__.py.
+# This matches the modern PEP 621 pattern — one canonical value that
+# both `import pyusbip; pyusbip.__version__` and `pip show pyusbip`
+# resolve to. To bump the version, edit `__version__` in
+# pyusbip/__init__.py — nothing else.
+dynamic = ["version"]
+
 dependencies = [
     "libusb1>=3.0.0",
 ]
-dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=6.0",
-    "pytest-asyncio", 
+    "pytest-asyncio",
     "black",
     "flake8",
 ]
@@ -48,5 +56,43 @@ Homepage = "https://github.com/jenish-rudani/pyusbip"
 "Bug Reports" = "https://github.com/jenish-rudani/pyusbip/issues"
 Source = "https://github.com/jenish-rudani/pyusbip"
 
-[tool.setuptools_scm]
-write_to = "pyusbip/_version.py"
+[tool.setuptools.dynamic]
+version = {attr = "pyusbip.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyusbip*"]
+exclude = ["tests*"]
+
+# ---------------------------------------------------------------------------
+# Ruff: combined linter + formatter (replaces black + flake8 + isort).
+# Modern Python toolchain default. Run via `ruff check .` and `ruff format .`
+# or — preferred — via the pre-commit hooks (see .pre-commit-config.yaml).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+extend-exclude = ["build", "dist", ".venv", "pyusbip.egg-info"]
+
+[tool.ruff.lint]
+# Curated rule set. Add codes as the project's appetite grows; the defaults
+# here cover the wins ruff is known for (E/F flake8 base, W warnings, I
+# import sorting, UP pyupgrade) without being noisy on a Python 3.8 floor.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line-too-long — let `ruff format` police long lines
+    "B008",  # function-call-in-default-arg — common in argparse/dataclass code
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
