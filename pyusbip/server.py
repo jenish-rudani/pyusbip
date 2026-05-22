@@ -3,9 +3,9 @@
 This module is the libusb-touching half of pyusbip — everything that
 holds device handles, claims interfaces, and shuffles bytes between
 USB and the USB/IP wire format. The HTTP control plane (`control.py`)
-and the bind registry (`registry.py`) deliberately don't import this
-module, so a future replacement (e.g. a pure-Rust core via PyO3) can
-swap `USBIPServer` out without touching the API surface seen by GUIs.
+deliberately doesn't import this module's USBIPConnection so a future
+replacement (e.g. a pure-Rust core via PyO3) can swap `USBIPServer`
+out without touching the API surface seen by GUIs.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from typing import Any, Callable
 
 import usb1
 
-from . import events as ev
 from .protocol import (
     USB_ENOENT,
     USB_EPIPE,
@@ -53,7 +52,6 @@ from .protocol import (
     USBIPUnimplementedException,
     libusb_status_to_usbip_errno,
 )
-from .registry import Registry
 
 logger = logging.getLogger("pyusbip.server")
 
@@ -119,9 +117,6 @@ class USBIPConnection:
         usbctx: usb1.USBContext,
         *,
         vid_filter: set | None = None,
-        registry: Registry | None = None,
-        require_bind: bool = False,
-        event_bus: ev.EventBus | None = None,
         on_attach: Callable[[str, str], None] | None = None,
         on_detach: Callable[[str, str], None] | None = None,
     ):
@@ -129,9 +124,6 @@ class USBIPConnection:
         self.writer = writer
         self.usbctx = usbctx
         self.vid_filter = vid_filter
-        self.registry = registry
-        self.require_bind = require_bind
-        self.event_bus = event_bus
         # on_attach/on_detach let USBIPServer maintain its attached-by
         # map without USBIPConnection needing a back-reference. Called
         # with (busid, peer_str) right after a successful IMPORT and
@@ -163,17 +155,10 @@ class USBIPConnection:
     # ---- filtering ------------------------------------------------------
 
     def _device_allowed(self, dev) -> bool:
-        """Apply --vid filter + bind registry to decide whether a
-        device should appear in DEVLIST / be IMPORTable on this
-        connection."""
+        """Apply --vid filter to decide whether a device should appear
+        in DEVLIST / be IMPORTable on this connection."""
         if self.vid_filter is not None and dev.getVendorID() not in self.vid_filter:
             return False
-        if self.require_bind:
-            if self.registry is None or not self.registry:
-                return False
-            serial = _read_serial_safely(dev)
-            if not self.registry.is_allowed(dev.getVendorID(), dev.getProductID(), serial):
-                return False
         return True
 
     # ---- protocol packers (preserved from the monolith) -----------------
@@ -375,11 +360,6 @@ class USBIPConnection:
             self.writer.write(resp)
             if self._on_attach:
                 self._on_attach(busid, str(self._peer))
-            if self.event_bus:
-                self.event_bus.publish(
-                    ev.DEVICE_ATTACHED,
-                    {"bus_id": busid, "peer": str(self._peer)},
-                )
             return
 
         self.say(f"IMPORT {busid} → device not found")
@@ -1000,23 +980,16 @@ class USBIPConnection:
 
             if busid and self._on_detach:
                 self._on_detach(busid, str(self._peer))
-            if self.event_bus and busid:
-                self.event_bus.publish(
-                    ev.DEVICE_DETACHED,
-                    {"bus_id": busid, "peer": str(self._peer)},
-                )
 
 
 class USBIPServer:
-    """High-level wrapper around the asyncio TCP server, libusb pollfd
-    integration, and (optionally) libusb hotplug callbacks.
+    """High-level wrapper around the asyncio TCP server and libusb
+    pollfd integration.
 
-    Construct once, call `start()` to bind, then `await stop_event.wait()`
-    or use `serve_forever()` from `main()`. All wiring for vid-filter /
-    registry / event-bus is via constructor — the per-connection
-    `USBIPConnection` reads from these attributes on every request, so
-    runtime changes (operator binds a new device) take effect on the
-    next DEVLIST/IMPORT without restarting the server.
+    Construct once, call `start()` to bind, then run the asyncio loop
+    via `main()`. The per-connection `USBIPConnection` reads
+    `self.vid_filter` on every request, so a runtime change to the
+    filter takes effect on the next DEVLIST/IMPORT.
     """
 
     def __init__(
@@ -1027,20 +1000,13 @@ class USBIPServer:
         host: str = "127.0.0.1",
         port: int = 3240,
         vid_filter: set | None = None,
-        registry: Registry | None = None,
-        require_bind: bool = False,
-        event_bus: ev.EventBus | None = None,
     ):
         self.loop = loop
         self.usbctx = usbctx
         self.host = host
         self.port = port
         self.vid_filter = vid_filter
-        self.registry = registry
-        self.require_bind = require_bind
-        self.event_bus = event_bus
         self._server: asyncio.base_events.Server | None = None
-        self._hotplug_handle = None
         # busid -> peer-string. Mutated only from the asyncio loop
         # thread (USBIPConnection._on_attach/_on_detach are called
         # synchronously from handle_op_import / cleanup), so no lock.
@@ -1072,9 +1038,6 @@ class USBIPServer:
             writer,
             self.usbctx,
             vid_filter=self.vid_filter,
-            registry=self.registry,
-            require_bind=self.require_bind,
-            event_bus=self.event_bus,
             on_attach=self._track_attach,
             on_detach=self._track_detach,
         )
@@ -1084,8 +1047,10 @@ class USBIPServer:
         self._server = await asyncio.start_server(self._handle, self.host, self.port)
 
         # libusb pollfd integration: wire libusb's fds into our loop so
-        # the asynchronous bulk-transfer callbacks dispatch here without
-        # a separate libusb event thread.
+        # the asynchronous bulk-transfer callbacks dispatch from the
+        # asyncio thread (no separate libusb event thread needed —
+        # see the README "Why no threaded event loop?" section for
+        # the experiment that ruled it out).
         def usb_callback():
             self.usbctx.handleEventsTimeout()
 
@@ -1098,40 +1063,6 @@ class USBIPServer:
         for fd, events in self.usbctx.getPollFDList():
             usb_added(fd, events)
         self.usbctx.setPollFDNotifiers(usb_added, usb_removed)
-
-        # libusb hotplug — fires from libusb's event thread on plug /
-        # unplug. We re-publish via EventBus.publish() which itself is
-        # thread-safe.
-        if self.event_bus is not None:
-            try:
-                self._hotplug_handle = self.usbctx.hotplugRegisterCallback(self._on_hotplug)
-            except Exception as e:
-                # Hotplug isn't supported on every libusb backend
-                # (notably some macOS minor versions historically).
-                # Not fatal — clients can still poll GET /devices.
-                logger.warning(
-                    "hotplug registration failed: %s; falling back to poll-only",
-                    e,
-                )
-
-    def _on_hotplug(self, ctx, dev, event):
-        """libusb hotplug callback. Runs on libusb's event thread, NOT
-        in the asyncio loop — keep this fast and only call thread-safe
-        APIs (EventBus.publish uses call_soon_threadsafe)."""
-        if self.event_bus is None:
-            return
-        kind = ev.DEVICE_ADDED if event == usb1.HOTPLUG_EVENT_DEVICE_ARRIVED else ev.DEVICE_REMOVED
-        try:
-            payload = {
-                "bus_id": _busid_for(dev),
-                "vid": dev.getVendorID(),
-                "pid": dev.getProductID(),
-            }
-        except Exception:
-            # Some devices race the callback — getDescriptor may fail
-            # if the device disappeared mid-callback.
-            payload = {"bus_id": ""}
-        self.event_bus.publish(kind, payload)
 
     async def stop(self) -> None:
         active_busids = list(self.attached_by_busid.keys())
@@ -1182,9 +1113,4 @@ class USBIPServer:
                             "reap sockets at process exit"
                         )
             except BaseException:
-                pass
-        if self._hotplug_handle is not None:
-            try:
-                self.usbctx.hotplugDeregisterCallback(self._hotplug_handle)
-            except Exception:
                 pass
