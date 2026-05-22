@@ -113,17 +113,24 @@ class Registry:
         """Read entries from `self.path`. Missing file == empty
         registry. Malformed JSON is logged and ignored — pyusbip
         should still start so the operator can fix the file via the
-        control plane."""
+        control plane. On parse failure we keep whatever entries are
+        already in memory (defensive against typos clobbering live
+        bindings on a SIGHUP reload)."""
         if not self.path:
             return
         try:
             with open(self.path) as f:
                 data = json.load(f)
         except FileNotFoundError:
-            logger.info("registry: no shared file at %s, starting empty", self.path)
+            logger.info("registry: no shared file at %s, registry empty", self.path)
             return
         except (OSError, json.JSONDecodeError) as e:
-            logger.warning("registry: failed to load %s: %s; starting empty", self.path, e)
+            logger.warning(
+                "registry: failed to load %s: %s; keeping current %d in-memory entries",
+                self.path,
+                e,
+                len(self.entries),
+            )
             return
 
         with self._lock:
@@ -194,9 +201,16 @@ class Registry:
                     return True
         return False
 
-    def list(self) -> builtins.list[Match]:
+    def snapshot(self) -> builtins.list[Match]:
+        """Returns a copy of the current allowlist entries. Use this
+        instead of accessing self.entries directly so the lock is
+        honored. Renamed from `list` to avoid shadowing the builtin."""
         with self._lock:
             return list(self.entries)
+
+    # Backward-compat alias. Will be removed in a future major version.
+    def list(self) -> builtins.list[Match]:
+        return self.snapshot()
 
     def __bool__(self) -> bool:
         with self._lock:

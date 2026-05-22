@@ -36,24 +36,24 @@ logger = logging.getLogger("pyusbip.control")
 API_VERSION = 1
 
 
-def _hex(n: int | None) -> str | None:
-    return None if n is None else f"0x{n:04x}"
-
-
-def _read_string_safely(hnd_open_fn, getter_name: str) -> str:
-    """Open the device briefly and read a string descriptor.
-    Returns "" on any error. Shared with _read_serial_safely in
-    server.py but kept separate so control.py doesn't import the
-    helper directly (one-way dependency: control -> server, not
-    server -> control)."""
+def _read_device_strings(dev) -> tuple[str, str, str]:
+    """Open the device once and read all three string descriptors we
+    surface in /devices: (manufacturer, product, serial). Returns
+    ("", "", "") on any failure. Single open/close cycle — the
+    previous design did three opens per device, which made /devices
+    take 600ms+ on stations with many USB devices."""
     try:
-        hnd = hnd_open_fn()
+        hnd = dev.open()
         try:
-            return getattr(hnd, getter_name)() or ""
+            return (
+                hnd.getManufacturer() or "",
+                hnd.getProduct() or "",
+                hnd.getSerialNumber() or "",
+            )
         finally:
             hnd.close()
     except Exception:
-        return ""
+        return ("", "", "")
 
 
 def _describe_device(
@@ -62,15 +62,14 @@ def _describe_device(
     attached_by_busid: dict[str, str],
     registry: Registry | None,
 ) -> dict[str, Any]:
-    """Build the JSON record for one libusb device. Reads strings
-    lazily via brief open/close; if the device is already in use we
-    fall back to empty strings rather than failing the whole list."""
+    """Build the JSON record for one libusb device. Reads all string
+    descriptors in a single device-open cycle; if the device is
+    already in use we fall back to empty strings rather than failing
+    the whole list."""
     busid = _busid_for(dev)
     vid = dev.getVendorID()
     pid = dev.getProductID()
-    serial = _read_serial_safely(dev)
-    manufacturer = _read_string_safely(dev.open, "getManufacturer")
-    product = _read_string_safely(dev.open, "getProduct")
+    manufacturer, product, serial = _read_device_strings(dev)
     attached_by = attached_by_busid.get(busid)
 
     bound = False
@@ -264,7 +263,7 @@ class ControlPlane:
             "version": pkg_version,
             "api_version": API_VERSION,
             "uptime_s": int(time.time() - self._started_at),
-            "devices_total": sum(1 for _ in self.usbctx.getDeviceList()),
+            "devices_total": len(self.usbctx.getDeviceList()),
             "attached_total": len(self.usbip_server.attached_by_busid),
             "bind_entries": len(self.registry),
             "require_bind": self.usbip_server.require_bind,
@@ -341,7 +340,7 @@ class ControlPlane:
                 "ok": True,
                 "changed": changed,
                 "match": match.to_dict(),
-                "entries": [m.to_dict() for m in self.registry.list()],
+                "entries": [m.to_dict() for m in self.registry.snapshot()],
             },
         )
 
@@ -409,7 +408,16 @@ class ControlPlane:
         await writer.drain()
 
     async def _sse_write(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
-        line = "data: " + json.dumps(payload) + "\n\n"
+        # Skip writes on a closing transport — the client dropped
+        # mid-stream and drain() would raise.
+        if writer.is_closing():
+            return
+        # Named SSE events: emit `event: <type>` so consumers can use
+        # eventSource.addEventListener('device_added', handler) rather
+        # than the catch-all onmessage. Falls back to "message" when
+        # no type is present (the SSE default).
+        event_name = payload.get("type", "message") if isinstance(payload, dict) else "message"
+        line = f"event: {event_name}\ndata: {json.dumps(payload)}\n\n"
         writer.write(line.encode())
         await writer.drain()
 

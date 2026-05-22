@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 
 import usb1
@@ -35,7 +36,7 @@ from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
 # SINGLE SOURCE OF TRUTH for the package version.
 # pyproject.toml reads this via [tool.setuptools.dynamic].
 # Bump here when releasing — nothing else to update.
-__version__ = "1.0.12"
+__version__ = "1.1.0"
 
 __all__ = [
     "ControlPlane",
@@ -138,7 +139,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--shared-file",
         default=DEFAULT_SHARED_FILE,
         help="JSON file holding the persistent bind allowlist "
-        "(default: %(default)s). Created on first --bind.",
+        "(default: %(default)s). Created automatically when the first "
+        "entry is added via POST /bind on the control plane.",
     )
     parser.add_argument(
         "--require-bind",
@@ -168,6 +170,8 @@ def main(argv: list[str] | None = None) -> None:
             "exporting only VID(s): %s",
             ", ".join(f"0x{v:04x}" for v in sorted(vid_filter)),
         )
+    else:
+        logger.info("exporting all libusb-visible devices (no --vid filter)")
 
     # Load the registry early — operator may have pre-populated it via
     # a previous run or an out-of-band edit, and we want hotplug events
@@ -242,6 +246,24 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("ready — Ctrl-C to exit")
 
     loop.run_until_complete(_startup())
+
+    # SIGHUP → reload the allowlist file. Lets the operator edit
+    # /etc/pyusbip/shared.json by hand and apply changes without
+    # restarting the server. The handler runs on whatever thread
+    # delivered the signal; Registry.load() is internally locked, so
+    # it's safe to call from anywhere. We log on the main logger so
+    # the reload is visible.
+    def _reload_registry(*_):
+        logger.info("SIGHUP received — reloading registry from %s", args.shared_file)
+        registry.load()
+
+    try:
+        loop.add_signal_handler(signal.SIGHUP, _reload_registry)
+    except (NotImplementedError, AttributeError):
+        # SIGHUP isn't on Windows; loop.add_signal_handler isn't on
+        # ProactorEventLoop. Either way, silently skip — operators
+        # on those platforms can restart pyusbip to apply edits.
+        pass
 
     try:
         loop.run_forever()

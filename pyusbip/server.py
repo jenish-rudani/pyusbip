@@ -289,7 +289,25 @@ class USBIPConnection:
                 product = ""
             vid_pid = f"{dev.getVendorID():04x}:{dev.getProductID():04x}"
 
-            hnd = dev.open()
+            # dev.open() can itself raise (USBErrorAccess, USBErrorBusy,
+            # USBErrorNoDevice if hotplug removed mid-DEVLIST→IMPORT).
+            # Wrap it so any open failure produces a clean ST_NA reject
+            # instead of a Python traceback.
+            try:
+                hnd = dev.open()
+            except usb1.USBError as open_err:
+                self.say(
+                    f"IMPORT {busid} → open failed ({open_err}); "
+                    f"another process may hold the device, or it was unplugged"
+                )
+                resp = struct.pack(
+                    ">HHI",
+                    USBIP_VERSION,
+                    USBIP_OP_IMPORT | USBIP_REPLY,
+                    USBIP_ST_NA,
+                )
+                self.writer.write(resp)
+                return
 
             # Programmatic smoke test before we tell the client the
             # IMPORT succeeded. A previous session's libusb cleanup
@@ -299,21 +317,17 @@ class USBIPConnection:
             # real I/O. Catching it here means the client sees a
             # clean ST_NA reject instead of "IMPORT succeeded, then
             # the very first URB failed" — and we attempt a
-            # libusb_reset_device to unstick the device for the
-            # next attempt.
+            # libusb_reset_device to unstick the device for the next
+            # attempt.
             #
-            # We use getConfiguration() rather than a string
-            # descriptor read because it's the cheapest control
-            # transfer that actually round-trips to the device.
+            # We catch usb1.USBError (the base class) rather than an
+            # explicit tuple so all libusb error variants — NoDevice,
+            # NotFound, IO, Timeout, Access, Busy, Pipe, Overflow —
+            # take the reset-and-reject path.
             try:
                 current_cfg = hnd.getConfiguration()
                 self.trace(f"IMPORT {busid} smoke test ok (current cfg={current_cfg})")
-            except (
-                usb1.USBErrorNoDevice,
-                usb1.USBErrorNotFound,
-                usb1.USBErrorIO,
-                usb1.USBErrorTimeout,
-            ) as smoke_err:
+            except usb1.USBError as smoke_err:
                 self.say(
                     f"IMPORT {busid} smoke test FAILED ({smoke_err}); "
                     f"handle is stale, attempting reset"
@@ -511,6 +525,14 @@ class USBIPConnection:
             if direction == USBIP_DIR_IN:
 
                 def callback(xfer_):
+                    # Callbacks can fire after _cleanup_devices closed
+                    # the writer (cancellation arrives at the transfer
+                    # asynchronously). Guard against writing to a
+                    # closed transport so we don't raise inside
+                    # libusb's C-level event handler.
+                    if self.writer.is_closing():
+                        self.urbs.pop(seqnum, None)
+                        return
                     self.trace(
                         f"callback IN seqnum {seqnum:x} status {xfer.getStatus()} len {xfer.getActualLength()} buflen {len(xfer.getBuffer())}"
                     )
@@ -530,13 +552,16 @@ class USBIPConnection:
                     )
                     resp += xfer.getBuffer()[: xfer.getActualLength()]
                     self.writer.write(resp)
-                    del self.urbs[seqnum]
+                    self.urbs.pop(seqnum, None)
 
                 xfer.setBulk(ep | 0x80, buflen, callback)
                 self._submit_bulk_or_stall(xfer, seqnum, dev)
             else:
 
                 def callback(xfer_):
+                    if self.writer.is_closing():
+                        self.urbs.pop(seqnum, None)
+                        return
                     self.trace(f"callback OUT seqnum {seqnum:x} status {xfer.getStatus()} ")
                     resp = struct.pack(
                         ">IIIIIiiiii8s",
@@ -553,7 +578,7 @@ class USBIPConnection:
                         b"",
                     )
                     self.writer.write(resp)
-                    del self.urbs[seqnum]
+                    self.urbs.pop(seqnum, None)
 
                 xfer.setBulk(ep, buf, callback)
                 self._submit_bulk_or_stall(xfer, seqnum, dev)
@@ -652,11 +677,11 @@ class USBIPConnection:
             0,
             b"",
         )
-        # NOTE: matches the monolith — original code packed the unlink
-        # response but didn't write it. Preserved verbatim to avoid
-        # surprising existing clients; flag for future cleanup if a
-        # real client ever cares about UNLINK acks.
-        _ = resp
+        # The Linux usbip-host kernel module waits for USBIP_RET_UNLINK
+        # for every CMD_UNLINK it sends; without this write the client's
+        # URB queue grows entries in "unlinking" state forever. The
+        # upstream monolith had this bug too — fixed here.
+        self.writer.write(resp)
 
     # ---- packet dispatch loop -------------------------------------------
 

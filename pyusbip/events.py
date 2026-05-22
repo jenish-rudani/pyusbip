@@ -71,14 +71,21 @@ class EventBus:
     def publish(self, event_type: str, payload: dict[str, Any]) -> None:
         """Publish an event. Safe to call from any thread (uses
         `call_soon_threadsafe` to hop onto the loop). Returns
-        immediately; never blocks on slow subscribers."""
+        immediately; never blocks on slow subscribers.
+
+        Silently drops events when the loop is already closed — that
+        happens when libusb's hotplug thread fires during shutdown,
+        after the asyncio loop has stopped accepting work. Without
+        the guard, call_soon_threadsafe raises RuntimeError into
+        libusb's C-level event handler, which doesn't handle Python
+        exceptions gracefully.
+        """
         event = {"type": event_type, **payload}
-        # Hop to the loop thread if we're not on it. libusb's hotplug
-        # callback runs on the libusb event thread, so this branch is
-        # taken for hotplug events; in-loop publishers (server.py)
-        # could call _dispatch directly but going through the loop is
-        # safer and the cost is negligible.
-        self._loop.call_soon_threadsafe(self._dispatch, event)
+        try:
+            self._loop.call_soon_threadsafe(self._dispatch, event)
+        except RuntimeError:
+            # Loop is closed — late hotplug event during/after shutdown.
+            pass
 
     def _dispatch(self, event: dict[str, Any]) -> None:
         for q in list(self._subscribers):
