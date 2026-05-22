@@ -773,6 +773,16 @@ class USBIPConnection:
                 if self._first_packet_logged:
                     self.say(f"closing session: {e}")
                 break
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                # Peer closed the TCP connection (RST, abort, or pipe
+                # broken mid-write). Typical cause: a process inside
+                # the dev container disconnected from the serial port
+                # and the VM's vhci-kernel-client tore down its
+                # USB/IP TCP session. Normal lifecycle event — no
+                # traceback, just a clean closing-session log.
+                if self._first_packet_logged:
+                    self.say(f"peer disconnected ({type(e).__name__})")
+                break
             except Exception:
                 if self._first_packet_logged:
                     traceback.print_exc()
