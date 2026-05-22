@@ -140,6 +140,13 @@ class USBIPConnection:
         self.devices: dict[int, USBIPDevice | None] = {}
         self.urbs: dict[int, USBIPPending] = {}
         self._peer = writer.get_extra_info("peername")
+        # True once we've read at least one byte from the peer.
+        # Distinguishes a real USB/IP session from a silent TCP
+        # liveness probe (Bia-Factory's pyusbipRunning() dials and
+        # closes without sending data). Set inside handle_packet so
+        # the "connect" log appears before any per-packet log
+        # (IMPORT, DEVLIST, …), not after.
+        self._first_packet_logged = False
 
     # ---- logging helpers ------------------------------------------------
 
@@ -599,6 +606,14 @@ class USBIPConnection:
         except asyncio.exceptions.IncompleteReadError:
             return False
 
+        # We've seen the first byte(s) — this is a real USB/IP
+        # session, not a silent TCP liveness probe. Log "connect"
+        # once, BEFORE we dispatch (so it appears above IMPORT /
+        # DEVLIST in the log instead of after).
+        if not self._first_packet_logged:
+            self.say("connect")
+            self._first_packet_logged = True
+
         (version,) = struct.unpack(">H", data)
         if version == 0x0000:
             op_common = ">HIIII"
@@ -633,8 +648,10 @@ class USBIPConnection:
                 self.say("DEVLIST")
                 self.handle_op_devlist()
             elif opcode == USBIP_OP_IMPORT | USBIP_REQUEST:
+                # handle_op_import logs the richer "IMPORT 2-18 →
+                # opened (0483:3754, STLINK-V3)" line; no need to
+                # double-log the bare request here.
                 data = (await self.reader.readexactly(USBIP_BUS_ID_SIZE)).decode().rstrip("\0")
-                self.say(f"IMPORT {data}")
                 self.handle_op_import(data)
             else:
                 raise USBIPProtocolErrorException(f"bad USBIP op {opcode:x}")
@@ -644,24 +661,14 @@ class USBIPConnection:
         return True
 
     async def connection(self) -> None:
-        # Deferred "connect" log: TCP liveness probes from Bia-Factory's
-        # pyusbipRunning() create a connection-then-close with zero
-        # bytes exchanged. Logging "connect" + "disconnect" for every
-        # one makes the log look like a real session is opening and
-        # closing constantly. Instead we wait until handle_packet has
-        # successfully received at least one packet before emitting
-        # the connect line; silent probes are demoted to a single
-        # debug-level line.
-        any_packet_received = False
-
+        # The "connect" log is emitted from handle_packet on the first
+        # byte read — so a silent TCP probe never sees a "connect"
+        # line, and a real session sees "connect" *before* any IMPORT
+        # / DEVLIST per-packet log. The mirror "disconnect" log here
+        # only fires for sessions that were announced.
         while True:
             try:
                 success = await self.handle_packet()
-                if not any_packet_received:
-                    # First packet on this connection — now it's a
-                    # real session worth announcing.
-                    self.say("connect")
-                    any_packet_received = True
                 await self.writer.drain()
                 if not success:
                     break
@@ -670,7 +677,7 @@ class USBIPConnection:
                 # cleanly after we finish device cleanup below — we
                 # specifically don't re-raise CancelledError because
                 # the surrounding _handle() shouldn't propagate it.
-                if any_packet_received:
+                if self._first_packet_logged:
                     self.say("connection cancelled")
                 break
             except USBIPProtocolErrorException as e:
@@ -678,11 +685,11 @@ class USBIPConnection:
                 # ourselves when libusb tells us the device is gone.
                 # No traceback: the cause was logged at the raise
                 # site with the actual libusb error.
-                if any_packet_received:
+                if self._first_packet_logged:
                     self.say(f"closing session: {e}")
                 break
             except Exception:
-                if any_packet_received:
+                if self._first_packet_logged:
                     traceback.print_exc()
                     self.say("force disconnect due to exception")
                 else:
@@ -691,12 +698,11 @@ class USBIPConnection:
                     self.trace("probe errored before any packet")
                 break
 
-        if any_packet_received:
+        if self._first_packet_logged:
             self.say("disconnect")
         else:
             self.trace("probe (no bytes sent)")
 
-        self.say("disconnect")
         try:
             self._cleanup_devices()
         except BaseException as e:
@@ -855,6 +861,11 @@ class USBIPServer:
         # thread (USBIPConnection._on_attach/_on_detach are called
         # synchronously from handle_op_import / cleanup), so no lock.
         self.attached_by_busid: dict[str, str] = {}
+        # Active client-handler tasks. We track them so stop() can
+        # cancel any still-pending tasks after the bounded
+        # wait_closed timeout — otherwise Python's asyncio prints
+        # "Task was destroyed but it is pending!" on a forced exit.
+        self._client_tasks: set[asyncio.Task] = set()
 
     def _track_attach(self, busid: str, peer: str) -> None:
         self.attached_by_busid[busid] = peer
@@ -863,6 +874,15 @@ class USBIPServer:
         self.attached_by_busid.pop(busid, None)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Register our own task so stop() can cancel it on forced
+        # shutdown. asyncio.current_task() returns the task running
+        # this coroutine. The discard-on-done callback keeps the set
+        # bounded across long sessions.
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
+            task.add_done_callback(self._client_tasks.discard)
+
         conn = USBIPConnection(
             reader,
             writer,
@@ -944,17 +964,39 @@ class USBIPServer:
             # active client handlers to finish — and our handlers don't
             # finish until the client closes its end. On normal Ctrl-C
             # shutdown the operator wants a fast exit, not a graceful
-            # drain, so cap at 2s. Beyond that we just stop awaiting;
-            # the OS will tear down the open sockets at process exit.
+            # drain, so cap at 2s.
             try:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
                 logger.info("USB/IP server stopped cleanly")
             except asyncio.TimeoutError:
-                logger.warning(
-                    "USB/IP server didn't drain in 2s — %d client(s) still "
-                    "open; forcing exit (OS will close sockets)",
-                    len(active_busids),
-                )
+                # Cancel any still-running client handlers explicitly.
+                # Without this, Python prints "Task was destroyed but
+                # it is pending!" at process exit because the handler
+                # tasks were holding a libusb device and the asyncio
+                # task object was reaped without being awaited.
+                pending = [t for t in self._client_tasks if not t.done()]
+                if pending:
+                    logger.warning(
+                        "USB/IP server didn't drain in 2s — cancelling "
+                        "%d client task(s) (devices: %s)",
+                        len(pending),
+                        ", ".join(active_busids) or "—",
+                    )
+                    for t in pending:
+                        t.cancel()
+                    # Brief wait for cancellation to propagate through
+                    # the handlers' _cleanup_devices(). Capped so a
+                    # stuck libusb close can't hang the shutdown.
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=1.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "client task(s) didn't cancel in 1s; OS will "
+                            "reap sockets at process exit"
+                        )
             except BaseException:
                 pass
         if self._hotplug_handle is not None:
