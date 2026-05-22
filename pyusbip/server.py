@@ -345,39 +345,49 @@ class USBIPConnection:
 
             self.trace(f"EP0 requesttype {bRequestType}, request {bRequest}")
 
-            fakeit = False
-
-            if bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_ADDRESS:
-                raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
-            elif bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_CONFIGURATION:
-                dev.hnd.setConfiguration(wValue)
-
-                config = None
-                for _config in dev.hnd.getDevice().iterConfigurations():
-                    if _config.getConfigurationValue() == wValue:
-                        config = _config
-                        break
-                n_ifaces = config.getNumInterfaces()
-                for i in range(n_ifaces):
-                    self.trace(f"  claim interface: {i}")
-                    try:
-                        if dev.hnd.kernelDriverActive(i):
-                            self.trace("    detach kernel driver")
-                            dev.hnd.detachKernelDriver(i)
-                    except usb1.USBError:
-                        self.trace("    kernel driver check failed")
-                        pass
-                    dev.hnd.claimInterface(i)
-                self.say(f"{dev.busid} configured: cfg={wValue}, claimed {n_ifaces} interface(s)")
-
-                fakeit = True
-            elif bRequestType == USB_RECIP_INTERFACE and bRequest == USB_REQ_SET_INTERFACE:
-                self.trace(f"set interface alt setting: {wIndex} -> {wValue}")
-                dev.hnd.claimInterface(wIndex)
-                dev.hnd.setInterfaceAltSetting(wIndex, wValue)
-                fakeit = True
-
+            # The whole EP0 path is wrapped in one libusb-error handler.
+            # Previously only the controlRead/controlWrite call was
+            # protected, so a libusb error during setConfiguration /
+            # setInterface (which happens BEFORE the read/write) would
+            # propagate up as an uncaught traceback. NO_DEVICE during
+            # SET_CONFIGURATION is the common case — observed when the
+            # device disappears between IMPORT and the first control
+            # transfer (e.g. a flaky cable, or another claim).
             try:
+                fakeit = False
+
+                if bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_ADDRESS:
+                    raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
+                elif bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_CONFIGURATION:
+                    dev.hnd.setConfiguration(wValue)
+
+                    config = None
+                    for _config in dev.hnd.getDevice().iterConfigurations():
+                        if _config.getConfigurationValue() == wValue:
+                            config = _config
+                            break
+                    n_ifaces = config.getNumInterfaces()
+                    for i in range(n_ifaces):
+                        self.trace(f"  claim interface: {i}")
+                        try:
+                            if dev.hnd.kernelDriverActive(i):
+                                self.trace("    detach kernel driver")
+                                dev.hnd.detachKernelDriver(i)
+                        except usb1.USBError:
+                            self.trace("    kernel driver check failed")
+                            pass
+                        dev.hnd.claimInterface(i)
+                    self.say(
+                        f"{dev.busid} configured: cfg={wValue}, claimed {n_ifaces} interface(s)"
+                    )
+
+                    fakeit = True
+                elif bRequestType == USB_RECIP_INTERFACE and bRequest == USB_REQ_SET_INTERFACE:
+                    self.trace(f"set interface alt setting: {wIndex} -> {wValue}")
+                    dev.hnd.claimInterface(wIndex)
+                    dev.hnd.setInterfaceAltSetting(wIndex, wValue)
+                    fakeit = True
+
                 if direction == USBIP_DIR_IN:
                     data = dev.hnd.controlRead(bRequestType, bRequest, wValue, wIndex, wLength)
                     resp = struct.pack(
@@ -419,7 +429,8 @@ class USBIPConnection:
                     self.trace(f"wrote {wlen}/{wLength} bytes")
                     self.writer.write(resp)
             except (usb1.USBErrorNoDevice, usb1.USBErrorNotFound) as e:
-                # Device went away (typical after a USB replug).
+                # Device went away — could be during setConfiguration,
+                # claimInterface, or the actual controlRead/Write call.
                 # See _submit_bulk_or_stall for the NO_DEVICE vs
                 # NOT_FOUND distinction. Tell the client this URB
                 # failed with -EPIPE so its kernel has a clean URB
@@ -433,16 +444,14 @@ class USBIPConnection:
                 # and benign. Quiet log.
                 self._respond_control_error(seqnum)
             except usb1.USBError as e:
-                # Any other libusb error on the control transfer:
+                # Any other libusb error on the EP0 path:
                 # USBErrorIO (LIBUSB_ERROR_IO), USBErrorTimeout,
                 # USBErrorOverflow, USBErrorBusy. Map all of them to
                 # -EPIPE on the wire — the client kernel will see a
                 # terminated URB and decide whether to retry / reset
                 # the endpoint, same behaviour as the Linux usbip-host
                 # kernel module. Log at INFO so the operator sees
-                # which class actually fired (USBErrorIO is what fires
-                # on macOS for a device that's been replugged but
-                # libusb hasn't refreshed yet).
+                # which class actually fired.
                 self.say(f"control transfer error: {e}")
                 self._respond_control_error(seqnum)
         else:
