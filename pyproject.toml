@@ -29,11 +29,12 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 
-# Single source of truth: read the version from pyusbip/__init__.py.
-# This matches the modern PEP 621 pattern — one canonical value that
-# both `import pyusbip; pyusbip.__version__` and `pip show pyusbip`
-# resolve to. To bump the version, edit `__version__` in
-# pyusbip/__init__.py — nothing else.
+# Single source of truth: read the version from pyusbip/_version.py.
+# Setuptools resolves this via AST (no execution), so the version
+# string can be read without importing the parent package — which is
+# important because pyusbip/__init__.py imports usb1 and would
+# otherwise need libusb1 + the libusb dylib installed at build time.
+# To bump the version, edit `__version__` in pyusbip/_version.py.
 dynamic = ["version"]
 
 dependencies = [
@@ -57,7 +58,7 @@ Homepage = "https://github.com/jenish-rudani/pyusbip"
 Source = "https://github.com/jenish-rudani/pyusbip"
 
 [tool.setuptools.dynamic]
-version = {attr = "pyusbip.__version__"}
+version = {attr = "pyusbip._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

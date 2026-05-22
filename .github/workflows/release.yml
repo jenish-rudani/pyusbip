@@ -55,10 +55,14 @@ jobs:
         # script) so a hypothetical malicious tag name can't break out
         # of the variable. See:
         # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+        #
+        # We import from pyusbip._version (not pyusbip) so reading the
+        # version doesn't pull in libusb1 — _version.py is deliberately
+        # import-free for exactly this case.
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-          PKG_VERSION=$(python -c "import pyusbip; print(pyusbip.__version__)")
+          PKG_VERSION=$(python -c "from pyusbip._version import __version__; print(__version__)")
           TAG_VERSION="${REF_NAME#v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::Tag '$TAG_VERSION' does not match pyusbip.__version__ '$PKG_VERSION'. Bump __version__ in pyusbip/__init__.py and re-tag."

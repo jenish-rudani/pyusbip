@@ -22,17 +22,13 @@ import sys
 
 import usb1
 
+from ._version import __version__
 from .control import ControlPlane
 from .protocol import (
     USBIPProtocolErrorException,
     USBIPUnimplementedException,
 )
 from .server import USBIPConnection, USBIPDevice, USBIPPending, USBIPServer
-
-# SINGLE SOURCE OF TRUTH for the package version.
-# pyproject.toml reads this via [tool.setuptools.dynamic].
-# Bump here when releasing — nothing else to update.
-__version__ = "2.0.0"
 
 __all__ = [
     "ControlPlane",
